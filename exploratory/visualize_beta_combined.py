@@ -1,5 +1,6 @@
 import argparse
 import sys
+import warnings
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -7,6 +8,9 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.colors
 import matplotlib.ticker
+
+# numpy renamed trapz to trapezoid in 2.0
+trapezoid = getattr(np, 'trapezoid', None) or np.trapz
 
 SERIES = ['#2a78d6', '#eb6834', '#1baf7a']
 INK = '#0b0b0b'
@@ -17,6 +21,8 @@ GRID_GRAY = '#d9d8d4'
 Z_EDGES = [0, 1, 2, 3, 4, 6, 8, np.inf]
 # |z_pred| thresholds used for the small-multiple bin scatter
 Z_THRESHOLDS = [0, 2, 4, 6]
+# |z_pred| bins used to stratify the lead-variant localization figures
+LEAD_Z_EDGES = [0, 1, 2, 3, 5, np.inf]
 # n_peaks bins
 N_PEAK_EDGES = [1, 2, 3, 6, 11, np.inf]
 # Fraction trimmed from each tail of the axes in the effect-size density scatter
@@ -30,24 +36,41 @@ SCATTER_Z_THRESHOLDS = [3, 5]
 ########################
 def load_pairs_with_prediction(beta_combined_file):
     # Stream the file in chunks, keeping only variant-gene pairs that have a beta_combined prediction
-    cols = ['beta_eqtl_hat', 'beta_eqtl_se', 'beta_combined', 'se_combined', 'n_peaks']
+    cols = ['gene_id', 'beta_eqtl_hat', 'beta_eqtl_se', 'beta_combined', 'se_combined', 'af', 'n_peaks']
+    # Unbiased prediction variance (may be negative) is written by newer versions of generate_beta_combined.py
+    header = pd.read_csv(beta_combined_file, sep='\t', nrows=0).columns
+    has_unbiased = 'var_combined_unbiased' in header
+    if has_unbiased:
+        cols = cols + ['var_combined_unbiased']
+    else:
+        print("WARNING: no var_combined_unbiased column; the noise-corrected correlation will use the conservative "
+              "se_combined^2, which overstates the noise and can give a negative corrected variance", flush=True)
     chunks = []
+    gene_max_chunks = []
     n_total = 0
     for chunk in pd.read_csv(beta_combined_file, sep='\t', usecols=cols, chunksize=5000000, na_values=['NA']):
         n_total += len(chunk)
+        # Per-gene max |z_eQTL| over every tested pair, so genes with no predicted variant are still counted as eGenes
+        ok = chunk['beta_eqtl_se'] > 0
+        gene_max_chunks.append((chunk.loc[ok, 'beta_eqtl_hat'] / chunk.loc[ok, 'beta_eqtl_se']).abs()
+                               .groupby(chunk.loc[ok, 'gene_id'].to_numpy()).max())
         chunk = chunk.dropna(subset=['beta_eqtl_hat', 'beta_eqtl_se', 'beta_combined', 'se_combined'])
         chunks.append(chunk)
         print("lines read: %d" % n_total, flush=True)
+    gene_max_abs_z_eqtl_all = pd.concat(gene_max_chunks).groupby(level=0).max() if gene_max_chunks else pd.Series(dtype=float)
     if len(chunks) == 0:
-        return pd.DataFrame(columns=cols + ['z_eqtl', 'z_pred'])
+        return pd.DataFrame(columns=cols + ['z_eqtl', 'z_pred']), gene_max_abs_z_eqtl_all
     df = pd.concat(chunks, ignore_index=True)
     # Drop pairs with a zero standard error, which would give infinite z-scores
     df = df[(df['beta_eqtl_se'] > 0) & (df['se_combined'] > 0)].reset_index(drop=True)
     df['n_peaks'] = df['n_peaks'].astype(int)
+    df['gene_id'] = df['gene_id'].astype('category')
+    if not has_unbiased:
+        df['var_combined_unbiased'] = df['se_combined'] ** 2
     df['z_eqtl'] = df['beta_eqtl_hat'] / df['beta_eqtl_se']
     df['z_pred'] = df['beta_combined'] / df['se_combined']
-    print("variant-gene pairs: %d; with prediction: %d" % (n_total, len(df)), flush=True)
-    return df
+    print("variant-gene pairs: %d; with prediction: %d; genes tested: %d" % (n_total, len(df), len(gene_max_abs_z_eqtl_all)), flush=True)
+    return df, gene_max_abs_z_eqtl_all
 
 
 ########################
@@ -344,6 +367,462 @@ def fig_effect_size_density(x, y, cell_type, output_file, n_bins=400, note=None)
           % (int(counts.sum()), n_outside, xlim[0], xlim[1], ylim[0], ylim[1]), flush=True)
 
 
+
+def roc_pr_curve(score, label):
+    # ROC and precision-recall curves from a ranking score (higher = more likely positive), tie groups collapsed
+    order = np.argsort(-score, kind='stable')
+    s = score[order]
+    lab = label[order]
+    tp = np.cumsum(lab)
+    fp = np.cumsum(~lab)
+    last_of_tie = np.r_[s[1:] != s[:-1], True]
+    tp = tp[last_of_tie].astype(float)
+    fp = fp[last_of_tie].astype(float)
+    n_pos = tp[-1]
+    n_neg = fp[-1]
+    tpr = np.r_[0.0, tp / n_pos]
+    fpr = np.r_[0.0, fp / n_neg]
+    precision = tp / (tp + fp)
+    auroc = trapezoid(tpr, fpr)
+    auprc = trapezoid(precision, tp / n_pos)
+    return fpr, tpr, tp / n_pos, precision, auroc, auprc
+
+
+def thin(*arrays, n=4000):
+    # Keep at most n evenly spaced points from each (equal-length) array, for plotting
+    m = len(arrays[0])
+    idx = np.unique(np.linspace(0, m - 1, min(n, m)).astype(int))
+    return [a[idx] for a in arrays]
+
+
+def fig_roc_pr(scores, label, label_name, cell_type, output_file):
+    # ROC and precision-recall for detecting label using each score; scores: list of (name, array)
+    fig, (ax_roc, ax_pr) = plt.subplots(1, 2, figsize=(8.6, 4.0))
+    base_rate = label.mean()
+    ax_roc.plot([0, 1], [0, 1], color=GRID_GRAY, linewidth=1, zorder=0)
+    ax_pr.axhline(base_rate, color=GRID_GRAY, linewidth=1, zorder=0)
+    ax_pr.text(0.99, base_rate, 'base rate', fontsize=8, color=INK_SECONDARY, va='bottom', ha='right')
+    rows = []
+    for (name, score), color in zip(scores, SERIES):
+        fpr, tpr, recall, precision, auroc, auprc = roc_pr_curve(score, label)
+        fpr_t, tpr_t = thin(fpr, tpr)
+        recall_t, precision_t = thin(recall, precision)
+        ax_roc.plot(fpr_t, tpr_t, color=color, linewidth=1.5, label='%s (AUC = %.3f)' % (name, auroc), zorder=3)
+        ax_pr.plot(recall_t, precision_t, color=color, linewidth=1.5, label='%s (AUC = %.3f)' % (name, auprc), zorder=3)
+        rows.append((name, int(label.sum()), int((~label).sum()), auroc, auprc))
+    ax_roc.set_xlabel('False positive rate', color=INK, fontsize=9)
+    ax_roc.set_ylabel('True positive rate', color=INK, fontsize=9)
+    ax_pr.set_xlabel('Recall', color=INK, fontsize=9)
+    ax_pr.set_ylabel('Precision', color=INK, fontsize=9)
+    ax_pr.set_yscale('log')
+    for ax in (ax_roc, ax_pr):
+        ax.set_xlim(0, 1)
+        style_axes(ax)
+        ax.legend(frameon=False, fontsize=8, labelcolor=INK_SECONDARY, loc='lower right' if ax is ax_roc else 'upper right')
+    ax_roc.set_ylim(0, 1)
+    fig.suptitle('%s cells: detecting %s (n = %s positive of %s pairs)'
+                 % (cell_type, label_name, format(int(label.sum()), ','), format(len(label), ',')), fontsize=10, color=INK)
+    fig.tight_layout()
+    fig.savefig(output_file)
+    plt.close(fig)
+
+    summary = pd.DataFrame(rows, columns=['score', 'n_positive', 'n_negative', 'auroc', 'auprc'])
+    summary.to_csv(summary_path(output_file), sep='\t', index=False)
+    return summary
+
+
+def per_gene_table(df, gene_max_abs_z_eqtl_all):
+    # One row per gene with at least one predicted variant:
+    #   n_variants          number of variants with a prediction
+    #   lead_*              the eQTL lead among predicted variants (largest |z_eQTL|)
+    #   max_abs_z_pred      largest |z_pred| in the gene; top_pred_abs_z_eqtl is |z_eQTL| at that variant
+    #   n_better_predicted  number of variants ranked above the lead by |z_pred|; percentile = rank / (n - 1)
+    #   spearman            Spearman correlation of beta_pred vs beta_eQTL across the gene's variants
+    #   max_abs_z_eqtl_all  largest |z_eQTL| over every tested pair for the gene, predicted or not
+    # Group on integer category codes (cheap); map back to gene names at the end
+    key = df['gene_id'].cat.codes.to_numpy()
+    gene_names = np.asarray(df['gene_id'].cat.categories)
+    g = pd.DataFrame({'gene': key, 'abs_z_eqtl': np.abs(df['z_eqtl'].to_numpy()), 'abs_z_pred': np.abs(df['z_pred'].to_numpy()),
+                      'beta_pred': df['beta_combined'].to_numpy(), 'beta_eqtl': df['beta_eqtl_hat'].to_numpy(),
+                      'n_peaks': df['n_peaks'].to_numpy()})
+    grouped = g.groupby('gene', sort=False)
+    n_var = grouped.size()
+    lead = g.loc[grouped['abs_z_eqtl'].idxmax()].set_index('gene')
+    top = g.loc[grouped['abs_z_pred'].idxmax()].set_index('gene')
+    lead_pred_per_row = g['gene'].map(lead['abs_z_pred']).to_numpy(dtype=float)
+    n_better = pd.Series(g['abs_z_pred'].to_numpy() > lead_pred_per_row).groupby(key, sort=False).sum()
+
+    # Spearman via ranks within gene and per-gene sums
+    rx = grouped['beta_pred'].rank().to_numpy()
+    ry = grouped['beta_eqtl'].rank().to_numpy()
+    def gsum(v):
+        return pd.Series(v).groupby(key, sort=False).sum()
+    sx, sy, sxx, syy, sxy = gsum(rx), gsum(ry), gsum(rx * rx), gsum(ry * ry), gsum(rx * ry)
+    n = n_var.reindex(sx.index).astype(float)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        rho = (sxy - sx * sy / n) / np.sqrt((sxx - sx ** 2 / n) * (syy - sy ** 2 / n))
+
+    genes = pd.DataFrame({'n_variants': n_var, 'lead_abs_z_eqtl': lead['abs_z_eqtl'], 'lead_abs_z_pred': lead['abs_z_pred'],
+                          'max_abs_z_pred': top['abs_z_pred'], 'top_pred_abs_z_eqtl': top['abs_z_eqtl'],
+                          'max_n_peaks': grouped['n_peaks'].max(), 'n_better_predicted': n_better.reindex(n_var.index),
+                          'spearman': rho.reindex(n_var.index)})
+    with np.errstate(divide='ignore', invalid='ignore'):
+        genes['percentile'] = np.where(genes['n_variants'] > 1, genes['n_better_predicted'] / (genes['n_variants'] - 1), np.nan)
+    genes.index = pd.Index(gene_names[genes.index.to_numpy()], name='gene_id')
+    genes['max_abs_z_eqtl_all'] = gene_max_abs_z_eqtl_all.reindex(genes.index).to_numpy()
+    return genes
+
+
+def fig_lead_variant_rank(genes, cell_type, output_file, min_variants=20, egene_z=4, n_bins=20):
+    # For each gene, the percentile rank of its eQTL lead variant (largest |z_eQTL|) by |z_pred| among the gene's
+    # predicted variants (0 = lead is also the top predicted variant). Under the null the percentile is uniform.
+    # Genes are split by whether the lead is a confident eQTL (|z_eQTL| > egene_z).
+    genes = genes[genes['n_variants'] >= min_variants]
+    is_egene = genes['lead_abs_z_eqtl'] > egene_z
+    series = [('Lead |z_eQTL| > %g' % egene_z, is_egene), ('Lead |z_eQTL| ≤ %g' % egene_z, ~is_egene)]
+    edges = np.linspace(0, 1, n_bins + 1)
+    fig, ax = plt.subplots(figsize=(6.2, 4.4))
+    ax.axhline(1.0 / n_bins, color=GRID_GRAY, linewidth=1, zorder=0)
+    ax.text(0.99, 1.0 / n_bins, 'uniform', fontsize=8, color=INK_SECONDARY, va='bottom', ha='right', transform=ax.get_yaxis_transform())
+    rows = []
+    width = 1.0 / n_bins
+    for k, ((name, sel), color) in enumerate(zip(series, SERIES)):
+        pct = genes.loc[sel, 'percentile'].to_numpy()
+        if len(pct) == 0:
+            continue
+        counts, _ = np.histogram(np.clip(pct, 0, 1 - 1e-12), bins=edges)
+        frac = counts / len(pct)
+        ax.bar(edges[:-1] + k * width / 2, frac, width=width / 2, align='edge', color=color, edgecolor='white', linewidth=0.5,
+               label='%s (n = %s genes; top 5%%: %.1f%%, top 10%%: %.1f%%)'
+               % (name, format(len(pct), ','), 100 * (pct <= 0.05).mean(), 100 * (pct <= 0.10).mean()), zorder=3)
+        for lo, hi, c, f in zip(edges[:-1], edges[1:], counts, frac):
+            rows.append((name, lo, hi, int(c), f))
+    ax.set_xlim(0, 1)
+    ax.set_xlabel('Percentile rank of eQTL lead variant by |z_pred| within gene (0 = top predicted)', color=INK, fontsize=9)
+    ax.set_ylabel('Fraction of genes', color=INK, fontsize=9)
+    ax.set_title('%s cells (genes with ≥ %d predicted variants)' % (cell_type, min_variants), fontsize=10, color=INK)
+    style_axes(ax)
+    ax.legend(frameon=False, fontsize=7.5, labelcolor=INK_SECONDARY)
+    fig.tight_layout()
+    fig.savefig(output_file)
+    plt.close(fig)
+
+    summary = pd.DataFrame(rows, columns=['series', 'percentile_lower', 'percentile_upper', 'n_genes', 'fraction'])
+    summary.to_csv(summary_path(output_file), sep='\t', index=False)
+    return summary
+
+
+def fig_gene_overlap(genes, cell_type, output_file, egene_z=4):
+    # For each gene, classify by where the eQTL is relative to the gene's top predicted variant, stacked by max |z_pred| bin
+    cats = ['Top predicted variant is an eQTL', 'eQTL elsewhere in gene', 'No eQTL in gene']
+    top_is_eqtl = (genes['top_pred_abs_z_eqtl'] > egene_z).to_numpy()
+    gene_has_eqtl = (genes['max_abs_z_eqtl_all'] > egene_z).to_numpy()
+    cat = np.where(top_is_eqtl, 0, np.where(gene_has_eqtl, 1, 2))
+    group = np.digitize(genes['max_abs_z_pred'].to_numpy(), LEAD_Z_EDGES[1:-1])
+    labels = range_labels(LEAD_Z_EDGES)
+    n_groups = len(labels)
+    counts = np.array([[int(((group == g) & (cat == c)).sum()) for c in range(3)] for g in range(n_groups)], dtype=float)
+    n = counts.sum(axis=1)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        frac = counts / n[:, None]
+
+    colors = [SERIES[0], SERIES[2], GRID_GRAY]
+    fig, ax = plt.subplots(figsize=(6.6, 4.4))
+    bottom = np.zeros(n_groups)
+    x = np.arange(n_groups)
+    for c in range(3):
+        ax.bar(x, frac[:, c], bottom=bottom, color=colors[c], edgecolor='white', linewidth=0.8, width=0.7, label=cats[c], zorder=3)
+        for xi, f, b in zip(x, frac[:, c], bottom):
+            if f > 0.04:
+                ax.text(xi, b + f / 2, '%.0f%%' % (100 * f), ha='center', va='center', fontsize=7.5,
+                        color='white' if c < 2 else INK_SECONDARY, zorder=4)
+        bottom += frac[:, c]
+    ax.set_xticks(x)
+    ax.set_xticklabels(['%s\nn = %s' % (lab, compact(int(k))) for lab, k in zip(labels, n)])
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("Maximum |z_pred| across the gene's predicted variants", color=INK)
+    ax.set_ylabel('Fraction of genes', color=INK)
+    ax.set_title('%s cells (eQTL: |z_eQTL| > %g)' % (cell_type, egene_z), fontsize=10, color=INK)
+    style_axes(ax)
+    ax.legend(frameon=False, fontsize=8, labelcolor=INK_SECONDARY, loc='upper center', bbox_to_anchor=(0.5, -0.22), ncol=3)
+    fig.tight_layout()
+    fig.savefig(output_file)
+    plt.close(fig)
+
+    rows = [(labels[g], int(n[g]), cats[c], int(counts[g, c]), frac[g, c]) for g in range(n_groups) for c in range(3)]
+    summary = pd.DataFrame(rows, columns=['max_abs_z_pred_bin', 'n_genes', 'category', 'n', 'fraction'])
+    summary.to_csv(summary_path(output_file), sep='\t', index=False)
+    return summary
+
+
+def ecdf_step(ax, v, color, label, log=False):
+    v = np.sort(np.asarray(v, dtype=float))
+    ax.step(v, np.arange(1, len(v) + 1) / len(v), where='post', color=color, linewidth=1.5, label=label, zorder=3)
+    if log:
+        ax.set_xscale('log')
+
+
+def fig_egene_coverage(genes, gene_max_abs_z_eqtl_all, cell_type, output_file, egene_z=4, confident_z=3):
+    # Why are most eGenes silent? Left: every tested gene split into no predicted variant / silent prediction /
+    # confident prediction, for eGenes and non-eGenes. Middle and right: number of predicted variants and max n_peaks
+    # per gene for silent vs confident eGenes.
+    all_genes = gene_max_abs_z_eqtl_all.index
+    is_egene = (gene_max_abs_z_eqtl_all > egene_z).to_numpy()
+    max_pred = genes['max_abs_z_pred'].reindex(all_genes).to_numpy()
+    status = np.where(np.isnan(max_pred), 0, np.where(max_pred > confident_z, 2, 1))
+    status_labels = ['No predicted variant', 'Silent (max |z_pred| ≤ %g)' % confident_z, 'Confident (max |z_pred| > %g)' % confident_z]
+
+    fig, (ax_s, ax_v, ax_p) = plt.subplots(1, 3, figsize=(13.0, 4.1))
+    rows = []
+    groups = [('eGenes', is_egene), ('Non-eGenes', ~is_egene)]
+    x = np.arange(3)
+    for k, ((name, sel), color) in enumerate(zip(groups, SERIES)):
+        n = int(sel.sum())
+        cnt = np.array([int((sel & (status == st)).sum()) for st in range(3)])
+        frac = cnt / n if n > 0 else np.zeros(3)
+        ax_s.bar(x + (k - 0.5) * 0.36, frac, width=0.36, color=color, edgecolor='white', linewidth=0.8,
+                 label='%s (n = %s)' % (name, format(n, ',')), zorder=3)
+        for xi, f, c in zip(x + (k - 0.5) * 0.36, frac, cnt):
+            ax_s.text(xi, f, compact(c), ha='center', va='bottom', fontsize=7, color=INK_SECONDARY)
+        for st in range(3):
+            rows.append((name, status_labels[st], int(cnt[st]), frac[st]))
+    ax_s.set_xticks(x)
+    ax_s.set_xticklabels([l.replace(' (', '\n(') for l in status_labels], fontsize=7.5)
+    ax_s.set_ylabel('Fraction of genes', color=INK, fontsize=9)
+    ax_s.set_title('Prediction status by gene (eGene: |z_eQTL| > %g anywhere)' % egene_z, fontsize=9, color=INK)
+    ax_s.legend(frameon=False, fontsize=8, labelcolor=INK_SECONDARY)
+    style_axes(ax_s)
+
+    egene_pred = genes[genes['max_abs_z_eqtl_all'] > egene_z]
+    silent = egene_pred[egene_pred['max_abs_z_pred'] <= confident_z]
+    confident = egene_pred[egene_pred['max_abs_z_pred'] > confident_z]
+    for ax, col, xlabel, log in [(ax_v, 'n_variants', 'Predicted variants per gene', True),
+                                 (ax_p, 'max_n_peaks', 'Max peaks contributing to a prediction', False)]:
+        for (name, sub), color in zip([('Silent eGenes', silent), ('Confident eGenes', confident)], [SERIES[1], SERIES[0]]):
+            if len(sub) == 0:
+                continue
+            ecdf_step(ax, sub[col], color, '%s (n = %s, median = %g)' % (name, format(len(sub), ','), np.median(sub[col])), log=log)
+        ax.set_xlabel(xlabel, color=INK, fontsize=9)
+        ax.set_ylabel('Cumulative fraction of eGenes', color=INK, fontsize=9)
+        ax.set_ylim(0, 1)
+        ax.legend(frameon=False, fontsize=7.5, labelcolor=INK_SECONDARY, loc='lower right')
+        style_axes(ax)
+    fig.suptitle('%s cells' % cell_type, fontsize=10, color=INK)
+    fig.tight_layout()
+    fig.savefig(output_file)
+    plt.close(fig)
+
+    summary = pd.DataFrame(rows, columns=['group', 'status', 'n', 'fraction'])
+    summary.to_csv(summary_path(output_file), sep='\t', index=False)
+    return summary
+
+
+def fig_gene_correlation(genes, cell_type, output_file, min_variants=20, egene_z=4, n_bins=20):
+    # Per-gene Spearman correlation between predicted and observed effects across the gene's variants,
+    # eGenes vs non-eGenes (the latter is the null: no true effect to track)
+    genes = genes[(genes['n_variants'] >= min_variants) & genes['spearman'].notna()]
+    is_egene = genes['lead_abs_z_eqtl'] > egene_z
+    series = [('Lead |z_eQTL| > %g' % egene_z, is_egene), ('Lead |z_eQTL| ≤ %g' % egene_z, ~is_egene)]
+    edges = np.linspace(-1, 1, n_bins + 1)
+    width = edges[1] - edges[0]
+    fig, ax = plt.subplots(figsize=(6.2, 4.4))
+    ax.axvline(0, color=GRID_GRAY, linewidth=1, zorder=0)
+    rows = []
+    for (name, sel), color in zip(series, SERIES):
+        r = genes.loc[sel, 'spearman'].to_numpy()
+        if len(r) == 0:
+            continue
+        counts, _ = np.histogram(r, bins=edges)
+        dens = counts / len(r) / width
+        ax.step(edges, np.r_[dens, dens[-1]], where='post', color=color, linewidth=1.5,
+                label='%s (n = %s; median = %.2f; ρ > 0.3: %.0f%%)' % (name, format(len(r), ','), np.median(r), 100 * (r > 0.3).mean()), zorder=3)
+        for lo, hi, c, d in zip(edges[:-1], edges[1:], counts, dens):
+            rows.append((name, lo, hi, int(c), d))
+    ax.set_xlim(-1, 1)
+    ax.set_xlabel('Spearman correlation of β_pred vs β_eQTL across variants within gene', color=INK, fontsize=9)
+    ax.set_ylabel('Density of genes', color=INK, fontsize=9)
+    ax.set_title('%s cells (genes with ≥ %d predicted variants)' % (cell_type, min_variants), fontsize=10, color=INK)
+    style_axes(ax)
+    ax.legend(frameon=False, fontsize=7.5, labelcolor=INK_SECONDARY, loc='upper left')
+    fig.tight_layout()
+    fig.savefig(output_file)
+    plt.close(fig)
+
+    summary = pd.DataFrame(rows, columns=['series', 'rho_lower', 'rho_upper', 'n_genes', 'density'])
+    summary.to_csv(summary_path(output_file), sep='\t', index=False)
+    return summary
+
+def fig_undiscovered_pairs(z_pred, z_eqtl, beta_pred, cell_type, output_file, uncalled_z=4, n_hist_bins=40):
+    # Restricted to pairs the eQTL study did not call (|z_eQTL| < uncalled_z): does a confident prediction
+    # mark pairs with real but sub-threshold eQTL signal? Left: z_eQTL oriented to the predicted direction
+    # (positive = same sign as the prediction), for confident vs low-confidence predictions, against a
+    # standard normal. Middle / right: sign concordance and the rate of 2 < |z_eQTL| < uncalled_z by |z_pred| bin.
+    uncalled = np.abs(z_eqtl) < uncalled_z
+    abs_zp = np.abs(z_pred)
+    oriented = z_eqtl * np.sign(beta_pred)
+    groups = [('|z_pred| < 1 (control)', abs_zp < 1), ('3 < |z_pred| ≤ 5', (abs_zp > 3) & (abs_zp <= 5)), ('|z_pred| > 5', abs_zp > 5)]
+
+    fig, (ax_h, ax_c, ax_m) = plt.subplots(1, 3, figsize=(13.0, 4.1))
+
+    # (a) oriented z_eQTL densities
+    edges = np.linspace(-uncalled_z, uncalled_z, n_hist_bins + 1)
+    width = edges[1] - edges[0]
+    hist_rows = []
+    for (name, sel), color in zip(groups, SERIES):
+        m = uncalled & sel
+        n = int(m.sum())
+        if n == 0:
+            continue
+        counts, _ = np.histogram(oriented[m], bins=edges)
+        dens = counts / n / width
+        ax_h.step(edges, np.r_[dens, dens[-1]], where='post', color=color, linewidth=1.4,
+                  label='%s (n = %s, mean = %.2f)' % (name, compact(n), oriented[m].mean()), zorder=3)
+        for lo, hi, c, d in zip(edges[:-1], edges[1:], counts, dens):
+            hist_rows.append((name, lo, hi, int(c), d))
+    xs = np.linspace(-uncalled_z, uncalled_z, 400)
+    p_inside = 1 - two_sided_p_from_z(np.array([uncalled_z]))[0]
+    ax_h.plot(xs, np.exp(-xs ** 2 / 2) / np.sqrt(2 * np.pi) / p_inside, color=GRID_GRAY, linewidth=1.2, label='N(0,1)', zorder=2)
+    ax_h.axvline(0, color=GRID_GRAY, linewidth=1, zorder=0)
+    ax_h.set_xlabel('z_eQTL oriented to the predicted direction', color=INK, fontsize=9)
+    ax_h.set_ylabel('Density', color=INK, fontsize=9)
+    ax_h.set_xlim(-uncalled_z, uncalled_z)
+    ax_h.legend(frameon=False, fontsize=7, labelcolor=INK_SECONDARY, loc='upper left')
+    style_axes(ax_h)
+
+    # (b), (c) fractions by |z_pred| bin among uncalled pairs
+    z_group = np.digitize(abs_zp, Z_EDGES[1:-1])
+    labels = range_labels(Z_EDGES)
+    n_groups = len(labels)
+    frac_rows = []
+    panels = [(ax_c, oriented > 0, 'Fraction with concordant sign', 0.5, 'concordant_sign'),
+              (ax_m, np.abs(z_eqtl) > 2, 'Fraction with 2 < |z_eQTL| < %g' % uncalled_z, 0.0455, 'mid_z')]
+    for ax, indicator, ylabel, ref, key in panels:
+        ps, los, his, ns = [], [], [], []
+        for g in range(n_groups):
+            m = uncalled & (z_group == g)
+            n = int(m.sum())
+            k = int((m & indicator).sum())
+            p_, lo, hi = wilson_ci(k, n)
+            ps.append(p_); los.append(lo); his.append(hi); ns.append(n)
+            frac_rows.append((key, labels[g], n, k, p_, lo, hi))
+        ps, los, his = np.array(ps), np.array(los), np.array(his)
+        ax.axhline(ref, color=GRID_GRAY, linewidth=1, zorder=0)
+        ax.text(n_groups - 0.6, ref, 'null', fontsize=8, color=INK_SECONDARY, va='bottom', ha='right')
+        ax.errorbar(np.arange(n_groups), ps, yerr=[np.maximum(ps - los, 0), np.maximum(his - ps, 0)], fmt='o',
+                    color=SERIES[0], ecolor=SERIES[0], elinewidth=1, capsize=2, capthick=1, markersize=6,
+                    markeredgecolor='white', markeredgewidth=1, zorder=3)
+        ax.set_xticks(np.arange(n_groups))
+        ax.set_xticklabels(['%s\nn = %s' % (lab, compact(n)) for lab, n in zip(labels, ns)], fontsize=7.5)
+        ax.set_xlabel('|z_pred|', color=INK, fontsize=9)
+        ax.set_ylabel(ylabel, color=INK, fontsize=9)
+        style_axes(ax)
+
+    fig.suptitle('%s cells: pairs not called by the eQTL study (|z_eQTL| < %g)' % (cell_type, uncalled_z), fontsize=10, color=INK)
+    fig.tight_layout()
+    fig.savefig(output_file)
+    plt.close(fig)
+
+    pd.DataFrame(hist_rows, columns=['series', 'z_lower', 'z_upper', 'n', 'density']).to_csv(
+        output_file.rsplit('.', 1)[0] + '_hist_summary.tsv', sep='\t', index=False)
+    summary = pd.DataFrame(frac_rows, columns=['panel', 'abs_z_pred_bin', 'n', 'k', 'fraction', 'ci95_lower', 'ci95_upper'])
+    summary.to_csv(summary_path(output_file), sep='\t', index=False)
+    return summary
+
+
+
+def moment_correlation(x, y, var_x, var_y, n_blocks=200):
+    # Noise-corrected (disattenuated) correlation and slope of true effects from noisy estimates with known error
+    # variances, using only second moments (no normality assumed), over ALL supplied pairs (no selection):
+    #   cov(x_hat, y_hat) estimates cov(x, y) when errors are independent
+    #   var(x_hat) - mean(var_x) estimates var(x); likewise for y
+    # var_x / var_y only need the right mean, so individual entries may be negative (unbiased product variance).
+    # Standard errors from a block jackknife over n_blocks contiguous row blocks (rows are in genomic order,
+    # so blocks are genomic segments and LD between neighbouring pairs stays within blocks).
+    n = len(x)
+    idx = (np.arange(n) * n_blocks) // n
+    def bsum(v):
+        return np.bincount(idx, weights=v, minlength=n_blocks)
+    S = {'n': np.bincount(idx, minlength=n_blocks).astype(float), 'x': bsum(x), 'y': bsum(y), 'xx': bsum(x * x),
+         'yy': bsum(y * y), 'xy': bsum(x * y), 'sx2': bsum(var_x), 'sy2': bsum(var_y)}
+    names = ['r_naive', 'r_true', 'slope_naive', 'slope_true', 'reliability_x', 'reliability_y']
+
+    def estimates(T):
+        m = T['n']
+        mx, my = T['x'] / m, T['y'] / m
+        vx = T['xx'] / m - mx ** 2
+        vy = T['yy'] / m - my ** 2
+        cxy = T['xy'] / m - mx * my
+        vx_true = vx - T['sx2'] / m
+        vy_true = vy - T['sy2'] / m
+        with np.errstate(invalid='ignore', divide='ignore'):
+            r_true = cxy / np.sqrt(vx_true * vy_true) if vx_true > 0 and vy_true > 0 else np.nan
+            slope_true = cxy / vx_true if vx_true > 0 else np.nan
+            return np.array([cxy / np.sqrt(vx * vy), r_true, cxy / vx, slope_true, vx_true / vx, vy_true / vy])
+
+    total = {k: v.sum() for k, v in S.items()}
+    est = estimates(total)
+    jk = np.array([estimates({k: total[k] - S[k][b] for k in S}) for b in range(n_blocks)])
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        se = np.sqrt((n_blocks - 1) / n_blocks * np.nansum((jk - np.nanmean(jk, axis=0)) ** 2, axis=0))
+    se[np.isnan(est)] = np.nan
+    out = {name: est[i] for i, name in enumerate(names)}
+    out.update({name + '_se': se[i] for i, name in enumerate(names)})
+    out['n'] = n
+    return out
+
+
+def fig_moment_correlation(df, cell_type, output_file):
+    # Noise-corrected correlation of true predicted vs observed eQTL effects, with sensitivity analyses:
+    # trimming extreme predicted effects, and stratifying by minor allele frequency and number of peaks.
+    x = df['beta_combined'].to_numpy()
+    y = df['beta_eqtl_hat'].to_numpy()
+    vx = df['var_combined_unbiased'].to_numpy()
+    vy = df['beta_eqtl_se'].to_numpy() ** 2
+    af = df['af'].to_numpy()
+    maf = np.minimum(af, 1 - af)
+    n_peaks = df['n_peaks'].to_numpy()
+
+    # Sensitivity rows stratify on covariates only (MAF, n_peaks), never on the estimated effect or its SE: selecting
+    # on a noisy estimate removes real variance while the noise correction stays, and the prediction's SE is itself a
+    # function of the estimated betas, so filtering on it is indirect selection too.
+    analyses = [('All pairs', np.ones(len(x), dtype=bool))]
+    for lo, hi in [(0, 0.05), (0.05, 0.2), (0.2, 0.5)]:
+        analyses.append(('MAF %g–%g' % (lo, hi), (maf >= lo) & (maf < hi) if hi < 0.5 else (maf >= lo)))
+    for lo, hi in [(1, 3), (3, 11), (11, np.inf)]:
+        analyses.append(('n_peaks %s' % ('%d+' % lo if np.isinf(hi) else '%d–%d' % (lo, hi - 1)), (n_peaks >= lo) & (n_peaks < hi)))
+
+    rows = []
+    for name, mask in analyses:
+        if mask.sum() < 1000:
+            continue
+        res = moment_correlation(x[mask], y[mask], vx[mask], vy[mask])
+        res['analysis'] = name
+        rows.append(res)
+    summary = pd.DataFrame(rows).set_index('analysis')
+    summary.to_csv(summary_path(output_file), sep='\t')
+
+    fig, (ax_r, ax_s) = plt.subplots(1, 2, figsize=(10.4, 0.45 * len(summary) + 1.8), sharey=True)
+    ypos = np.arange(len(summary))[::-1]
+    for ax, naive, true, xlabel, ref in [(ax_r, 'r_naive', 'r_true', 'Correlation of predicted and observed effects', 0),
+                                         (ax_s, 'slope_naive', 'slope_true', 'Slope of observed on predicted effect', 1)]:
+        ax.axvline(ref, color=GRID_GRAY, linewidth=1, zorder=0)
+        ax.errorbar(summary[naive], ypos + 0.15, xerr=1.96 * summary[naive + '_se'], fmt='o', color=SERIES[1], ecolor=SERIES[1],
+                    elinewidth=1, capsize=2, markersize=5, markeredgecolor='white', label='Naive (attenuated)', zorder=3)
+        ax.errorbar(summary[true], ypos - 0.15, xerr=1.96 * summary[true + '_se'], fmt='o', color=SERIES[0], ecolor=SERIES[0],
+                    elinewidth=1, capsize=2, markersize=6.5, markeredgecolor='white', label='Noise-corrected', zorder=4)
+        ax.set_xlabel(xlabel, color=INK, fontsize=9)
+        style_axes(ax)
+    ax_r.set_yticks(ypos)
+    ax_r.set_yticklabels(['%s\n(n = %s)' % (name, compact(n)) for name, n in zip(summary.index, summary['n'])], fontsize=8)
+    ax_r.legend(frameon=False, fontsize=8, labelcolor=INK_SECONDARY, loc='lower right')
+    fig.suptitle('%s cells: noise-corrected correlation (block jackknife 95%% CI)' % cell_type, fontsize=10, color=INK)
+    fig.tight_layout()
+    fig.savefig(output_file)
+    plt.close(fig)
+    return summary
+
+
 ########################
 # Main
 ########################
@@ -361,7 +840,7 @@ def parse_args():
 if __name__ == '__main__':
     args = parse_args()
 
-    df = load_pairs_with_prediction(args.beta_combined_file)
+    df, gene_max_abs_z_eqtl_all = load_pairs_with_prediction(args.beta_combined_file)
     if len(df) < args.n_bins:
         print("Not enough variant-gene pairs with a prediction to form %d bins: %d" % (args.n_bins, len(df)))
         sys.exit(1)
@@ -440,3 +919,72 @@ if __name__ == '__main__':
                                     note='|z_pred| > %g and |z_eQTL| > %g, n = %s pairs' % (t, t, format(int(confident_both.sum()), ',')))
         else:
             print("No pairs with |z| > %g in both the prediction and the eQTL; skipping that scatter" % t, flush=True)
+
+    # 10. Same scatter restricted to confident predictions only (|z_pred| > 5), with no restriction on the eQTL z
+    confident_pred = np.abs(z_pred) > 5
+    if confident_pred.sum() > 1:
+        fig_effect_size_density(beta_pred[confident_pred], beta_eqtl[confident_pred], args.cell_type,
+                                '%s_effect_size_scatter_pred_z5.png' % args.output_prefix,
+                                note='|z_pred| > 5 (no restriction on z_eQTL), n = %s pairs' % format(int(confident_pred.sum()), ','))
+    else:
+        print("No pairs with |z_pred| > 5; skipping that scatter", flush=True)
+
+    # 11. Reverse of figure 5: fraction of pairs with a confident prediction, by |z_eQTL| bin
+    z_eqtl_group = np.digitize(np.abs(z_eqtl), Z_EDGES[1:-1])
+    summary = fig_fraction_by_group(z_eqtl_group, z_labels,
+                                    [('|z_pred| > 2', all_pairs, np.abs(z_pred) > 2),
+                                     ('|z_pred| > 3', all_pairs, np.abs(z_pred) > 3),
+                                     ('|z_pred| > 5', all_pairs, np.abs(z_pred) > 5)],
+                                    args.cell_type, '|z_eQTL|', 'Fraction of pairs with confident prediction',
+                                    '%s_pred_confidence_by_eqtl_signal.%s' % (args.output_prefix, fmt),
+                                    ref_line=0.0455, ref_label='null (|z| > 2)')
+    print(summary.to_string(index=False), flush=True)
+
+    # 12. ROC / precision-recall for detecting observed eQTLs (|z_eQTL| > 4) from |z_pred|, with n_peaks as a baseline
+    is_eqtl = np.abs(z_eqtl) > 4
+    if is_eqtl.sum() > 0 and (~is_eqtl).sum() > 0:
+        summary = fig_roc_pr([('|z_pred|', np.abs(z_pred)), ('n_peaks', n_peaks.astype(float))], is_eqtl, '|z_eQTL| > 4',
+                             args.cell_type, '%s_eqtl_detection_roc_pr.%s' % (args.output_prefix, fmt))
+        print(summary.to_string(index=False), flush=True)
+
+    # 13. Within-gene localization: percentile rank of each gene's eQTL lead variant by |z_pred|
+    genes = per_gene_table(df, gene_max_abs_z_eqtl_all)
+    genes.to_csv('%s_per_gene.tsv' % args.output_prefix, sep='\t')
+    summary = fig_lead_variant_rank(genes, args.cell_type, '%s_lead_variant_pred_rank.%s' % (args.output_prefix, fmt))
+    print(summary.to_string(index=False), flush=True)
+    genes20 = genes[genes['n_variants'] >= 20]
+
+    # 14. Lead localization as a function of prediction confidence: fraction of genes whose eQTL lead is in the
+    #     top 5% by |z_pred|, stratified by (a) the gene's maximum |z_pred| over all its variants and (b) the lead's own |z_pred|
+    is_egene = (genes20['lead_abs_z_eqtl'] > 4).to_numpy()
+    lead_top5 = (genes20['percentile'] <= 0.05).to_numpy()
+    gene_series = [('Lead |z_eQTL| > 4', is_egene, lead_top5), ('Lead |z_eQTL| ≤ 4', ~is_egene, lead_top5)]
+    for key, col, xlabel in [('gene_max', 'max_abs_z_pred', 'Maximum |z_pred| across the gene\'s variants'),
+                             ('lead', 'lead_abs_z_pred', '|z_pred| of the eQTL lead variant')]:
+        conf_group = np.digitize(genes20[col].to_numpy(), LEAD_Z_EDGES[1:-1])
+        summary = fig_fraction_by_group(conf_group, range_labels(LEAD_Z_EDGES), gene_series, args.cell_type, xlabel,
+                                        'Fraction of genes with eQTL lead in top 5% by |z_pred|',
+                                        '%s_lead_variant_top5_by_%s_z_pred.%s' % (args.output_prefix, key, fmt),
+                                        ref_line=0.05, ref_label='uniform')
+        print(summary.to_string(index=False), flush=True)
+
+    # 15. Discovery: among pairs the eQTL study did not call, is a confident prediction enriched for sub-threshold signal?
+    summary = fig_undiscovered_pairs(z_pred, z_eqtl, beta_pred, args.cell_type,
+                                     '%s_undiscovered_pairs.%s' % (args.output_prefix, fmt))
+    print(summary.to_string(index=False), flush=True)
+
+    # 16. Gene-level overlap: where the eQTL sits relative to the gene's top predicted variant, by prediction confidence
+    summary = fig_gene_overlap(genes, args.cell_type, '%s_gene_overlap.%s' % (args.output_prefix, fmt))
+    print(summary.to_string(index=False), flush=True)
+
+    # 17. Why eGenes are silent: prediction status of every tested gene, and coverage of silent vs confident eGenes
+    summary = fig_egene_coverage(genes, gene_max_abs_z_eqtl_all, args.cell_type, '%s_egene_coverage.%s' % (args.output_prefix, fmt))
+    print(summary.to_string(index=False), flush=True)
+
+    # 18. Per-gene correlation between predicted and observed effects
+    summary = fig_gene_correlation(genes, args.cell_type, '%s_gene_correlation.%s' % (args.output_prefix, fmt))
+    print(summary.to_string(index=False), flush=True)
+
+    # 19. Noise-corrected correlation of true predicted vs observed effects (method of moments, block jackknife)
+    summary = fig_moment_correlation(df, args.cell_type, '%s_moment_correlation.%s' % (args.output_prefix, fmt))
+    print(summary[['n', 'r_naive', 'r_true', 'r_true_se', 'slope_true', 'slope_true_se', 'reliability_x', 'reliability_y']].to_string(), flush=True)

@@ -41,7 +41,6 @@ done
 fi
 
 
-
 # Second, plot observed vs chromatin-predicted eqtl effects by percentile of predicted effect
 if false; then
 for cell_type in "B" "CD4_T" "Mono"; do
@@ -50,6 +49,6 @@ done
 fi
 
 cell_type="B"
-
     sh visualize_beta_combined.sh ${cell_type} ${pred_beta_combined_dir} ${visualization_dir}
+
 
