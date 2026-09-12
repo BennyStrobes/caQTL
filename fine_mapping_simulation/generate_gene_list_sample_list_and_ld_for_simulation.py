@@ -75,7 +75,8 @@ n_genes = int(sys.argv[5])
 
 chrom_num=5
 cis_window_size = 50000
-np.random.seed(1)
+min_variants_per_gene = 50
+np.random.seed(2)
 
 # Output stem
 output_stem = ld_directory + 'n_genes_' + str(n_genes) + '_eqtl_sample_size_' + str(eqtl_sample_size)
@@ -128,6 +129,11 @@ for i in range(len(gene_names)):
     keep = G.std(axis=1) > 0
     G = G[keep, :]
     cis_variant_ids = cis_variant_ids[keep]
+
+    # If we have fewer than the minimum number of variants, skip this gene
+    if len(cis_variant_ids) < min_variants_per_gene:
+        print('Skipping gene ' + gene_name + ' because it has only ' + str(len(cis_variant_ids)) + ' variants in the cis window')
+        continue
 
     # Generate LD
     ld_mat = np.corrcoef(G)
