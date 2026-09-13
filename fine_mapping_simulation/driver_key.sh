@@ -19,6 +19,8 @@ sumstats_output_dir="${output_root}simulated_sumstats/"
 
 simulation_fine_mapping_results_dir="${output_root}simulated_fine_mapping_results/"
 
+visualization_dir="${output_root}visualizations/"
+
 
 ##################
 # Run analysis
@@ -36,8 +38,17 @@ fi
 gene_summary_file="${LD_dir}n_genes_${n_genes}_eqtl_sample_size_${eqtl_sample_size}_cross_gene_summary.txt"
 ########################
 # Loop through simulation numbers and run simulation
+n_simulations="20"
 if false; then
-for simulation_number in $(seq 1 20); do
+
+for simulation_number in $(seq 1 ${n_simulations}); do
     sbatch run_fine_mapping_simulation.sh ${simulation_number} ${gene_summary_file} ${sumstats_output_dir} $simulation_fine_mapping_results_dir $eqtl_sample_size
 done
 fi
+
+
+########################
+# Organize results across simulations and make calibration / power plots
+organized_results_file="${simulation_fine_mapping_results_dir}organized_fine_mapping_results_n_simulations_${n_simulations}_eqtl_sample_size_${eqtl_sample_size}.txt"
+sh organize_and_visualize_fine_mapping_simulation_results.sh ${simulation_fine_mapping_results_dir} ${sumstats_output_dir} ${n_simulations} ${eqtl_sample_size} ${organized_results_file} ${visualization_dir}
+
