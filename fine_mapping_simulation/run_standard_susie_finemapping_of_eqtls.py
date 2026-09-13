@@ -49,7 +49,6 @@ for line in f:
     #caqtl_se_file = data[6]
     #peak_gene_effects_file = data[7]
     #peak_gene_se_file = data[8]
-    print(gene_id)
 
     # Load in data for the gene
     ld_matrix = np.load(ld_file)
