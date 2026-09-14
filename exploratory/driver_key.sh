@@ -14,6 +14,9 @@ fingen_caqtl_dir=${fingen_data_dir}"caQTL/cis_nominal/"
 # peak-gene links data
 fingen_peak_gene_links_dir=${fingen_data_dir}"peak_gene_links/"
 
+# LOEUF file
+loeuf_file="/lab-share/CHIP-Strober-e2/Public/gene_annotation_files/gnomad.v4.1.constraint_metrics.tsv"
+
 ###############
 # Output directories
 ###############
@@ -44,11 +47,11 @@ fi
 # Second, plot observed vs chromatin-predicted eqtl effects by percentile of predicted effect
 if false; then
 for cell_type in "B" "CD4_T" "Mono"; do
-    sh visualize_beta_combined.sh ${cell_type} ${pred_beta_combined_dir} ${visualization_dir}
+    sh visualize_beta_combined.sh ${cell_type} ${pred_beta_combined_dir} ${visualization_dir} ${loeuf_file}
 done
 fi
 
 cell_type="B"
-    sh visualize_beta_combined.sh ${cell_type} ${pred_beta_combined_dir} ${visualization_dir}
+    sh visualize_beta_combined.sh ${cell_type} ${pred_beta_combined_dir} ${visualization_dir} ${loeuf_file}
 
 

@@ -29,13 +29,17 @@ N_PEAK_EDGES = [1, 2, 3, 6, 11, np.inf]
 SCATTER_TAIL_QUANTILE = 0.0005
 # |z| thresholds applied to both the prediction and the observed eQTL in the confident effect-size scatters
 SCATTER_Z_THRESHOLDS = [3, 5]
+# Per-gene Bonferroni significance levels for the LOEUF-decile figures (one panel per level)
+BONF_ALPHAS = [0.05, 0.001]
 
 
 ########################
 # Data loading
 ########################
 def load_pairs_with_prediction(beta_combined_file):
-    # Stream the file in chunks, keeping only variant-gene pairs that have a beta_combined prediction
+    # Stream the file in chunks, keeping only variant-gene pairs that have a beta_combined prediction.
+    # Also returns gene_all, one row per tested gene (predicted or not): number of tested variants, max |z_eQTL| and the
+    # eQTL effect at that lead variant. These feed the per-gene Bonferroni eQTL calls.
     cols = ['gene_id', 'beta_eqtl_hat', 'beta_eqtl_se', 'beta_combined', 'se_combined', 'af', 'n_peaks']
     # Unbiased prediction variance (may be negative) is written by newer versions of generate_beta_combined.py
     header = pd.read_csv(beta_combined_file, sep='\t', nrows=0).columns
@@ -45,21 +49,40 @@ def load_pairs_with_prediction(beta_combined_file):
     else:
         print("WARNING: no var_combined_unbiased column; the noise-corrected correlation will use the conservative "
               "se_combined^2, which overstates the noise and can give a negative corrected variance", flush=True)
+    # Components of the top contributing peak, written by newer versions of generate_beta_combined.py
+    has_components = 'beta_caqtl_top' in header and 'beta_link_top' in header
+    if has_components:
+        cols = cols + ['beta_caqtl_top', 'beta_link_top']
+    else:
+        print("WARNING: no beta_caqtl_top / beta_link_top columns; the effect-size decomposition by LOEUF decile will be skipped", flush=True)
     chunks = []
-    gene_max_chunks = []
+    gene_chunks = []
     n_total = 0
     for chunk in pd.read_csv(beta_combined_file, sep='\t', usecols=cols, chunksize=5000000, na_values=['NA']):
         n_total += len(chunk)
-        # Per-gene max |z_eQTL| over every tested pair, so genes with no predicted variant are still counted as eGenes
+        # Per gene within the chunk: number of tested pairs and the pair with the largest |z_eQTL|
         ok = chunk['beta_eqtl_se'] > 0
-        gene_max_chunks.append((chunk.loc[ok, 'beta_eqtl_hat'] / chunk.loc[ok, 'beta_eqtl_se']).abs()
-                               .groupby(chunk.loc[ok, 'gene_id'].to_numpy()).max())
+        sub = pd.DataFrame({'gene_id': chunk.loc[ok, 'gene_id'].to_numpy(),
+                            'abs_z': (chunk.loc[ok, 'beta_eqtl_hat'] / chunk.loc[ok, 'beta_eqtl_se']).abs().to_numpy(),
+                            'beta': chunk.loc[ok, 'beta_eqtl_hat'].to_numpy()})
+        if len(sub) > 0:
+            g = sub.groupby('gene_id', sort=False)
+            lead = sub.loc[g['abs_z'].idxmax()].set_index('gene_id')
+            lead['n_tested'] = g.size()
+            gene_chunks.append(lead)
         chunk = chunk.dropna(subset=['beta_eqtl_hat', 'beta_eqtl_se', 'beta_combined', 'se_combined'])
         chunks.append(chunk)
         print("lines read: %d" % n_total, flush=True)
-    gene_max_abs_z_eqtl_all = pd.concat(gene_max_chunks).groupby(level=0).max() if gene_max_chunks else pd.Series(dtype=float)
+    gene_cols = ['max_abs_z_eqtl_all', 'lead_beta_eqtl_all', 'n_tested_all']
+    if gene_chunks:
+        allg = pd.concat(gene_chunks).reset_index()
+        top = allg.loc[allg.groupby('gene_id')['abs_z'].idxmax()].set_index('gene_id')
+        gene_all = pd.DataFrame({'max_abs_z_eqtl_all': top['abs_z'], 'lead_beta_eqtl_all': top['beta'],
+                                 'n_tested_all': allg.groupby('gene_id')['n_tested'].sum().reindex(top.index)})
+    else:
+        gene_all = pd.DataFrame(columns=gene_cols, index=pd.Index([], name='gene_id'))
     if len(chunks) == 0:
-        return pd.DataFrame(columns=cols + ['z_eqtl', 'z_pred']), gene_max_abs_z_eqtl_all
+        return pd.DataFrame(columns=cols + ['z_eqtl', 'z_pred']), gene_all
     df = pd.concat(chunks, ignore_index=True)
     # Drop pairs with a zero standard error, which would give infinite z-scores
     df = df[(df['beta_eqtl_se'] > 0) & (df['se_combined'] > 0)].reset_index(drop=True)
@@ -69,8 +92,8 @@ def load_pairs_with_prediction(beta_combined_file):
         df['var_combined_unbiased'] = df['se_combined'] ** 2
     df['z_eqtl'] = df['beta_eqtl_hat'] / df['beta_eqtl_se']
     df['z_pred'] = df['beta_combined'] / df['se_combined']
-    print("variant-gene pairs: %d; with prediction: %d; genes tested: %d" % (n_total, len(df), len(gene_max_abs_z_eqtl_all)), flush=True)
-    return df, gene_max_abs_z_eqtl_all
+    print("variant-gene pairs: %d; with prediction: %d; genes tested: %d" % (n_total, len(df), len(gene_all)), flush=True)
+    return df, gene_all
 
 
 ########################
@@ -431,20 +454,26 @@ def fig_roc_pr(scores, label, label_name, cell_type, output_file):
     return summary
 
 
-def per_gene_table(df, gene_max_abs_z_eqtl_all):
+def per_gene_table(df, gene_all):
     # One row per gene with at least one predicted variant:
     #   n_variants          number of variants with a prediction
     #   lead_*              the eQTL lead among predicted variants (largest |z_eQTL|)
-    #   max_abs_z_pred      largest |z_pred| in the gene; top_pred_abs_z_eqtl is |z_eQTL| at that variant
+    #   max_abs_z_pred      largest |z_pred| in the gene; top_pred_* are values at that variant (|z_eQTL|, beta_combined,
+    #                       and the caQTL / link components of its top contributing peak when available)
     #   n_better_predicted  number of variants ranked above the lead by |z_pred|; percentile = rank / (n - 1)
     #   spearman            Spearman correlation of beta_pred vs beta_eQTL across the gene's variants
-    #   max_abs_z_eqtl_all  largest |z_eQTL| over every tested pair for the gene, predicted or not
+    #   *_all               from gene_all: over every tested pair for the gene, predicted or not (max |z_eQTL|, the
+    #                       eQTL effect at that lead, number of tested variants)
     # Group on integer category codes (cheap); map back to gene names at the end
     key = df['gene_id'].cat.codes.to_numpy()
     gene_names = np.asarray(df['gene_id'].cat.categories)
     g = pd.DataFrame({'gene': key, 'abs_z_eqtl': np.abs(df['z_eqtl'].to_numpy()), 'abs_z_pred': np.abs(df['z_pred'].to_numpy()),
                       'beta_pred': df['beta_combined'].to_numpy(), 'beta_eqtl': df['beta_eqtl_hat'].to_numpy(),
                       'n_peaks': df['n_peaks'].to_numpy()})
+    has_components = 'beta_caqtl_top' in df.columns
+    if has_components:
+        g['beta_caqtl_top'] = df['beta_caqtl_top'].to_numpy()
+        g['beta_link_top'] = df['beta_link_top'].to_numpy()
     grouped = g.groupby('gene', sort=False)
     n_var = grouped.size()
     lead = g.loc[grouped['abs_z_eqtl'].idxmax()].set_index('gene')
@@ -464,12 +493,17 @@ def per_gene_table(df, gene_max_abs_z_eqtl_all):
 
     genes = pd.DataFrame({'n_variants': n_var, 'lead_abs_z_eqtl': lead['abs_z_eqtl'], 'lead_abs_z_pred': lead['abs_z_pred'],
                           'max_abs_z_pred': top['abs_z_pred'], 'top_pred_abs_z_eqtl': top['abs_z_eqtl'],
+                          'top_pred_beta_combined': top['beta_pred'], 'top_pred_beta_eqtl': top['beta_eqtl'],
                           'max_n_peaks': grouped['n_peaks'].max(), 'n_better_predicted': n_better.reindex(n_var.index),
                           'spearman': rho.reindex(n_var.index)})
+    if has_components:
+        genes['top_pred_beta_caqtl'] = top['beta_caqtl_top']
+        genes['top_pred_beta_link'] = top['beta_link_top']
     with np.errstate(divide='ignore', invalid='ignore'):
         genes['percentile'] = np.where(genes['n_variants'] > 1, genes['n_better_predicted'] / (genes['n_variants'] - 1), np.nan)
     genes.index = pd.Index(gene_names[genes.index.to_numpy()], name='gene_id')
-    genes['max_abs_z_eqtl_all'] = gene_max_abs_z_eqtl_all.reindex(genes.index).to_numpy()
+    for col in ['max_abs_z_eqtl_all', 'lead_beta_eqtl_all', 'n_tested_all']:
+        genes[col] = gene_all[col].reindex(genes.index).to_numpy()
     return genes
 
 
@@ -824,6 +858,250 @@ def fig_moment_correlation(df, cell_type, output_file):
 
 
 ########################
+# LOEUF
+########################
+def load_loeuf_deciles(loeuf_file, gene_ids):
+    # gnomAD constraint metrics -> one LOEUF decile (1 = most constrained, 10 = least) per gene in gene_ids.
+    # Uses gnomAD's own genome-wide decile column when present, otherwise deciles of LOEUF across all MANE/canonical
+    # transcripts. Genes are matched on Ensembl ID (version stripped), falling back to gene symbol.
+    tab = pd.read_csv(loeuf_file, sep='\t', low_memory=False)
+    loeuf_col = next((c for c in ['lof.oe_ci.upper', 'oe_lof_upper'] if c in tab.columns), None)
+    if loeuf_col is None:
+        raise ValueError('No LOEUF column found in %s; columns: %s' % (loeuf_file, list(tab.columns)))
+    # One transcript per gene: MANE select if annotated, else canonical, else lowest LOEUF
+    for flag in ['mane_select', 'canonical']:
+        if flag in tab.columns:
+            sel = tab[flag].astype(str).str.lower().isin(['true', '1', 'yes'])
+            if sel.sum() > 0:
+                tab = tab[sel]
+                break
+    tab = tab.dropna(subset=[loeuf_col]).sort_values(loeuf_col)
+    decile_col = 'lof.oe_ci.upper_bin_decile' if 'lof.oe_ci.upper_bin_decile' in tab.columns else None
+    if decile_col is not None and tab[decile_col].notna().sum() > 0:
+        tab = tab.dropna(subset=[decile_col])
+        decile = tab[decile_col].astype(int).to_numpy() + 1
+        print("LOEUF deciles: gnomAD genome-wide decile column", flush=True)
+    else:
+        decile = equal_count_bins(tab[loeuf_col].to_numpy(), 10) + 1
+        print("LOEUF deciles: computed from LOEUF across %d transcripts" % len(tab), flush=True)
+    tab = pd.DataFrame({'loeuf': tab[loeuf_col].to_numpy(), 'decile': decile,
+                        'ensg': tab['gene_id'].astype(str).str.split('.').str[0].to_numpy() if 'gene_id' in tab.columns else None,
+                        'symbol': tab['gene'].astype(str).to_numpy() if 'gene' in tab.columns else None})
+    tab = tab.drop_duplicates('ensg', keep='first')
+
+    query = pd.Index(gene_ids)
+    by_ensg = tab.set_index('ensg').reindex(query.str.split('.').str[0])
+    by_symbol = tab.drop_duplicates('symbol').set_index('symbol').reindex(query)
+    n_ensg, n_symbol = int(by_ensg['decile'].notna().sum()), int(by_symbol['decile'].notna().sum())
+    matched = by_ensg if n_ensg >= n_symbol else by_symbol
+    print("LOEUF matched %d of %d genes (by %s)" % (int(matched['decile'].notna().sum()), len(query),
+                                                     'Ensembl ID' if n_ensg >= n_symbol else 'symbol'), flush=True)
+    out = pd.DataFrame({'loeuf': matched['loeuf'].to_numpy(), 'loeuf_decile': matched['decile'].to_numpy()}, index=query)
+    return out
+
+
+def gene_calls(genes, gene_all, alpha):
+    # Per-gene calibrated QTL calls over every tested gene. eqtl_call: Bonferroni on the minimum two-sided p across the
+    # gene's tested variants; pred_call: the same across the gene's predicted variants (False when there is none).
+    # Bonferroni is conservative under LD, so the calls are strict rather than exact, but unlike a fixed |z| cutoff on a
+    # max statistic they do not saturate with the number of variants.
+    calls = gene_all.copy()
+    calls['eqtl_p_bonf'] = np.minimum(1.0, two_sided_p_from_z(calls['max_abs_z_eqtl_all'].to_numpy(dtype=float))
+                                      * calls['n_tested_all'].to_numpy(dtype=float))
+    calls['eqtl_call'] = calls['eqtl_p_bonf'] < alpha
+    g = genes.reindex(calls.index)
+    calls['has_pred'] = g['n_variants'].notna().to_numpy()
+    calls['n_variants'] = g['n_variants'].to_numpy(dtype=float)
+    calls['max_abs_z_pred'] = g['max_abs_z_pred'].to_numpy(dtype=float)
+    p = two_sided_p_from_z(np.nan_to_num(calls['max_abs_z_pred'].to_numpy(), nan=0.0)) * np.nan_to_num(calls['n_variants'].to_numpy(), nan=1.0)
+    calls['pred_p_bonf'] = np.where(calls['has_pred'], np.minimum(1.0, p), np.nan)
+    calls['pred_call'] = calls['has_pred'].to_numpy() & (np.nan_to_num(calls['pred_p_bonf'].to_numpy(), nan=1.0) < alpha)
+    return calls
+
+
+def decile_index(loeuf, index):
+    # LOEUF decile as a 0-based group index aligned to index; -1 where the gene has no LOEUF value
+    d = loeuf['loeuf_decile'].reindex(index).to_numpy(dtype=float)
+    return np.where(np.isnan(d), -1, np.nan_to_num(d, nan=0) - 1).astype(int)
+
+
+DECILE_LABELS = [str(d) for d in range(1, 11)]
+DECILE_XLABEL = 'LOEUF decile (1 = most constrained); n genes below'
+
+
+def draw_fraction_by_decile(ax, group, series, colors=SERIES):
+    # Fraction (Wilson 95% CI) of an indicator within each LOEUF decile, for several (name, selection, indicator) series.
+    # Returns rows of (series, decile, n, k, fraction, lo, hi). Tick labels carry the first series' group sizes.
+    rows = []
+    offsets = np.linspace(-0.2, 0.2, len(series)) if len(series) > 1 else [0.0]
+    for (name, selection, indicator), offset, color in zip(series, offsets, colors):
+        ps, los, his = [], [], []
+        for d in range(10):
+            in_group = selection & (group == d)
+            n = int(in_group.sum())
+            k = int((in_group & indicator).sum())
+            p, lo, hi = wilson_ci(k, n)
+            ps.append(p)
+            los.append(lo)
+            his.append(hi)
+            rows.append((name, d + 1, n, k, p, lo, hi))
+        ps, los, his = np.array(ps), np.array(los), np.array(his)
+        ax.errorbar(np.arange(10) + offset, ps, yerr=[np.maximum(ps - los, 0), np.maximum(his - ps, 0)],
+                    fmt='o', color=color, ecolor=color, elinewidth=1, capsize=2, capthick=1, markersize=5.5,
+                    markeredgecolor='white', markeredgewidth=1, label=name, zorder=3)
+    first_sel = series[0][1]
+    ax.set_xticks(np.arange(10))
+    ax.set_xticklabels(['%s\n%s' % (lab, compact(int((first_sel & (group == d)).sum()))) for d, lab in enumerate(DECILE_LABELS)], fontsize=7.5)
+    ax.set_xlabel(DECILE_XLABEL, color=INK, fontsize=9)
+    ax.set_ylim(bottom=0)
+    style_axes(ax)
+    return rows
+
+
+def fig_qtl_fraction_by_loeuf_decile(genes, gene_all, loeuf, alphas, cell_type, output_file):
+    # Fraction of genes with a calibrated QTL call (per-gene Bonferroni p < alpha) in each LOEUF decile, for the observed
+    # eQTL and the chromatin prediction. Universe = every tested gene with a LOEUF value; a gene with no predicted variant
+    # counts as no call for the prediction. The third series conditions on having a prediction (coverage vs power).
+    group = decile_index(loeuf, gene_all.index)
+    has_loeuf = group >= 0
+    print("LOEUF figures: %d of %d tested genes have a LOEUF decile" % (int(has_loeuf.sum()), len(gene_all)), flush=True)
+    fig, axes = plt.subplots(1, len(alphas), figsize=(4.6 * len(alphas), 4.2), sharey=True)
+    axes = np.atleast_1d(axes)
+    rows = []
+    for ax, alpha in zip(axes, alphas):
+        calls = gene_calls(genes, gene_all, alpha)
+        eqtl_call, pred_call, has_pred = calls['eqtl_call'].to_numpy(), calls['pred_call'].to_numpy(), calls['has_pred'].to_numpy()
+        series = [('Observed eQTL (all genes)', has_loeuf, eqtl_call),
+                  ('Chromatin-predicted (all genes)', has_loeuf, pred_call),
+                  ('Chromatin-predicted (genes with a prediction)', has_loeuf & has_pred, pred_call)]
+        for r in draw_fraction_by_decile(ax, group, series):
+            rows.append((alpha,) + r)
+        ax.set_title('Per-gene Bonferroni p < %g' % alpha, fontsize=9, color=INK)
+    axes[0].set_ylabel('Fraction of genes with a QTL call', color=INK, fontsize=9)
+    axes[0].legend(frameon=False, fontsize=7.5, labelcolor=INK_SECONDARY, loc='upper left')
+    fig.suptitle('%s cells' % cell_type, fontsize=10, color=INK)
+    fig.tight_layout()
+    fig.savefig(output_file)
+    plt.close(fig)
+    summary = pd.DataFrame(rows, columns=['alpha', 'series', 'loeuf_decile', 'n_genes', 'n_called', 'fraction', 'ci95_lower', 'ci95_upper'])
+    summary.to_csv(summary_path(output_file), sep='\t', index=False)
+    return summary
+
+
+def fig_rescue_by_loeuf_decile(genes, gene_all, loeuf, alphas, cell_type, output_file):
+    # Recovery of missing regulation: among genes with no calibrated eQTL call, the fraction with a calibrated chromatin
+    # prediction, by LOEUF decile. Genes with an eQTL call are the comparison series. Universe as in the fraction figure.
+    group = decile_index(loeuf, gene_all.index)
+    has_loeuf = group >= 0
+    fig, axes = plt.subplots(1, len(alphas), figsize=(4.6 * len(alphas), 4.2), sharey=True)
+    axes = np.atleast_1d(axes)
+    rows = []
+    for ax, alpha in zip(axes, alphas):
+        calls = gene_calls(genes, gene_all, alpha)
+        eqtl_call, pred_call = calls['eqtl_call'].to_numpy(), calls['pred_call'].to_numpy()
+        series = [('Genes with no eQTL call', has_loeuf & ~eqtl_call, pred_call),
+                  ('Genes with an eQTL call', has_loeuf & eqtl_call, pred_call)]
+        for r in draw_fraction_by_decile(ax, group, series, colors=[SERIES[1], SERIES[0]]):
+            rows.append((alpha,) + r)
+        ax.set_title('Per-gene Bonferroni p < %g (both calls)' % alpha, fontsize=9, color=INK)
+    axes[0].set_ylabel('Fraction of genes with a chromatin-predicted QTL call', color=INK, fontsize=9)
+    axes[0].legend(frameon=False, fontsize=7.5, labelcolor=INK_SECONDARY, loc='upper right')
+    fig.suptitle('%s cells: chromatin-predicted calls at genes the eQTL scan did and did not call (tick counts: genes with no eQTL call)' % cell_type,
+                 fontsize=10, color=INK)
+    fig.tight_layout()
+    fig.savefig(output_file)
+    plt.close(fig)
+    summary = pd.DataFrame(rows, columns=['alpha', 'series', 'loeuf_decile', 'n_genes', 'n_pred_called', 'fraction', 'ci95_lower', 'ci95_upper'])
+    summary.to_csv(summary_path(output_file), sep='\t', index=False)
+    return summary
+
+
+def spearman_with_p(x, y):
+    # Spearman rho and an approximate two-sided p from the Fisher transform
+    n = len(x)
+    if n < 4:
+        return np.nan, np.nan
+    rx = pd.Series(x).rank().to_numpy()
+    ry = pd.Series(y).rank().to_numpy()
+    rho = np.corrcoef(rx, ry)[0, 1]
+    if not np.isfinite(rho) or abs(rho) >= 1:
+        return rho, np.nan
+    z = np.arctanh(rho) * np.sqrt((n - 3) / 1.06)
+    return rho, float(two_sided_p_from_z(np.array([z]))[0])
+
+
+def median_boot_ci(v, rng, n_boot=500):
+    # Median with a percentile bootstrap 95% CI
+    if len(v) == 0:
+        return np.nan, np.nan, np.nan
+    med = np.median(v)
+    if len(v) < 5:
+        return med, np.nan, np.nan
+    boots = np.median(rng.choice(v, size=(n_boot, len(v)), replace=True), axis=1)
+    return med, np.percentile(boots, 2.5), np.percentile(boots, 97.5)
+
+
+def fig_effect_size_by_loeuf_decile(genes, calls, loeuf, alpha, cell_type, output_file):
+    # Kanai et al. Fig. 5e/g/h/j analogue: median absolute effect at each gene's strongest variant, by LOEUF decile, with a
+    # bootstrap CI and the Spearman correlation between decile and effect. The variant is selected on significance
+    # (eQTL lead among genes with an eQTL call; top |z_pred| variant among genes with a prediction call), so the
+    # plotted effects carry winner's curse; the decile gradient is the comparison of interest, not the absolute level.
+    # Units differ between panels (Kanai: beta_eQTL in log counts per allele; beta_combined has no comparable unit).
+    group = decile_index(loeuf, calls.index)
+    g = genes.reindex(calls.index)
+    eqtl_call, pred_call = calls['eqtl_call'].to_numpy(), calls['pred_call'].to_numpy()
+    panels = [('|β_eQTL| at eQTL lead (genes with eQTL call)', 'eqtl', eqtl_call, np.abs(calls['lead_beta_eqtl_all'].to_numpy(dtype=float))),
+              ('|β_combined| at top predicted variant (genes with prediction call)', 'combined', pred_call,
+               np.abs(g['top_pred_beta_combined'].to_numpy(dtype=float)))]
+    if 'top_pred_beta_caqtl' in genes.columns:
+        panels += [('|β_caQTL| of top peak at top predicted variant', 'caqtl', pred_call, np.abs(g['top_pred_beta_caqtl'].to_numpy(dtype=float))),
+                   ('|β_link| of top peak at top predicted variant', 'link', pred_call, np.abs(g['top_pred_beta_link'].to_numpy(dtype=float)))]
+    rng = np.random.default_rng(0)
+    n_panels = len(panels)
+    n_cols = 2 if n_panels > 2 else n_panels
+    n_rows = int(np.ceil(n_panels / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.2 * n_cols, 3.9 * n_rows))
+    axes = np.atleast_1d(axes).ravel()
+    rows = []
+    for ax, (title, key, sel, v) in zip(axes, panels):
+        sel = sel & (group >= 0) & np.isfinite(v)
+        meds, los, his, ns = [], [], [], []
+        for d in range(10):
+            vals = v[sel & (group == d)]
+            med, lo, hi = median_boot_ci(vals, rng)
+            meds.append(med)
+            los.append(lo)
+            his.append(hi)
+            ns.append(len(vals))
+            rows.append((key, d + 1, len(vals), med, lo, hi))
+        meds, los, his = np.array(meds), np.array(los), np.array(his)
+        yerr = [np.nan_to_num(meds - los), np.nan_to_num(his - meds)]
+        ax.errorbar(np.arange(10), meds, yerr=yerr, fmt='o', color=SERIES[0], ecolor=SERIES[0], elinewidth=1, capsize=2,
+                    capthick=1, markersize=6, markeredgecolor='white', markeredgewidth=1, zorder=3)
+        rho, pval = spearman_with_p(group[sel] + 1, v[sel])
+        ax.text(0.03, 0.97, 'Spearman ρ = %.3f, p = %.1e (n = %s genes)' % (rho, pval, format(int(sel.sum()), ',')),
+                transform=ax.transAxes, fontsize=8, color=INK_SECONDARY, va='top')
+        ax.set_xticks(np.arange(10))
+        ax.set_xticklabels(['%s\n%s' % (lab, compact(n)) for lab, n in zip(DECILE_LABELS, ns)], fontsize=7.5)
+        ax.set_xlabel(DECILE_XLABEL, color=INK, fontsize=9)
+        ax.set_ylabel('Median absolute effect (bootstrap 95% CI)', color=INK, fontsize=9)
+        ax.set_ylim(bottom=0)
+        ax.set_title(title, fontsize=9, color=INK)
+        style_axes(ax)
+        rows.append((key + '_spearman', np.nan, int(sel.sum()), rho, pval, np.nan))
+    for ax in axes[n_panels:]:
+        ax.set_visible(False)
+    fig.suptitle('%s cells: effect size at the strongest variant by gene constraint (calls at Bonferroni p < %g)' % (cell_type, alpha),
+                 fontsize=10, color=INK)
+    fig.tight_layout()
+    fig.savefig(output_file)
+    plt.close(fig)
+    summary = pd.DataFrame(rows, columns=['effect', 'loeuf_decile', 'n_genes', 'median_or_rho', 'ci95_lower_or_p', 'ci95_upper'])
+    summary.to_csv(summary_path(output_file), sep='\t', index=False)
+    return summary
+
+
+########################
 # Main
 ########################
 def parse_args():
@@ -834,13 +1112,15 @@ def parse_args():
     parser.add_argument('--n_bins', type=int, default=100)
     parser.add_argument('--n_bins_stratified', type=int, default=20)
     parser.add_argument('--format', type=str, default='pdf')
+    parser.add_argument('--loeuf_file', type=str, default=None, help='gnomAD constraint metrics TSV; enables the LOEUF-decile figure')
     return parser.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
 
-    df, gene_max_abs_z_eqtl_all = load_pairs_with_prediction(args.beta_combined_file)
+    df, gene_all = load_pairs_with_prediction(args.beta_combined_file)
+    gene_max_abs_z_eqtl_all = gene_all['max_abs_z_eqtl_all']
     if len(df) < args.n_bins:
         print("Not enough variant-gene pairs with a prediction to form %d bins: %d" % (args.n_bins, len(df)))
         sys.exit(1)
@@ -948,7 +1228,7 @@ if __name__ == '__main__':
         print(summary.to_string(index=False), flush=True)
 
     # 13. Within-gene localization: percentile rank of each gene's eQTL lead variant by |z_pred|
-    genes = per_gene_table(df, gene_max_abs_z_eqtl_all)
+    genes = per_gene_table(df, gene_all)
     genes.to_csv('%s_per_gene.tsv' % args.output_prefix, sep='\t')
     summary = fig_lead_variant_rank(genes, args.cell_type, '%s_lead_variant_pred_rank.%s' % (args.output_prefix, fmt))
     print(summary.to_string(index=False), flush=True)
@@ -988,3 +1268,54 @@ if __name__ == '__main__':
     # 19. Noise-corrected correlation of true predicted vs observed effects (method of moments, block jackknife)
     summary = fig_moment_correlation(df, args.cell_type, '%s_moment_correlation.%s' % (args.output_prefix, fmt))
     print(summary[['n', 'r_naive', 'r_true', 'r_true_se', 'slope_true', 'slope_true_se', 'reliability_x', 'reliability_y']].to_string(), flush=True)
+
+    # 20-24. Gene constraint (LOEUF decile) analyses; all use per-gene Bonferroni calls rather than a fixed |z| cutoff
+    if args.loeuf_file is not None:
+        loeuf = load_loeuf_deciles(args.loeuf_file, gene_all.index)
+        alpha = BONF_ALPHAS[0]
+        calls = gene_calls(genes, gene_all, alpha)
+        genes = genes.join(loeuf).join(calls[['eqtl_p_bonf', 'eqtl_call', 'pred_p_bonf', 'pred_call']])
+        genes.to_csv('%s_per_gene.tsv' % args.output_prefix, sep='\t')
+        print("Bonferroni p < %g: eQTL calls %d of %d tested genes; prediction calls %d of %d genes with a prediction"
+              % (alpha, int(calls['eqtl_call'].sum()), len(calls), int(calls['pred_call'].sum()), int(calls['has_pred'].sum())), flush=True)
+
+        # 20. Fraction of genes with a QTL call (observed eQTL vs chromatin-predicted), by LOEUF decile
+        summary = fig_qtl_fraction_by_loeuf_decile(genes, gene_all, loeuf, BONF_ALPHAS, args.cell_type,
+                                                   '%s_qtl_fraction_by_loeuf_decile.%s' % (args.output_prefix, fmt))
+        print(summary.to_string(index=False), flush=True)
+
+        # 21. Rescue: chromatin-predicted calls among genes with no eQTL call, by LOEUF decile
+        summary = fig_rescue_by_loeuf_decile(genes, gene_all, loeuf, BONF_ALPHAS, args.cell_type,
+                                             '%s_rescue_by_loeuf_decile.%s' % (args.output_prefix, fmt))
+        print(summary.to_string(index=False), flush=True)
+
+        # 22. Effect size at the strongest variant by LOEUF decile (Kanai et al. Fig. 5 analogue), split into layers when available
+        summary = fig_effect_size_by_loeuf_decile(genes, calls, loeuf, alpha, args.cell_type,
+                                                  '%s_effect_size_by_loeuf_decile.%s' % (args.output_prefix, fmt))
+        print(summary.to_string(index=False), flush=True)
+
+        # 23. Localization by constraint: fraction of genes whose eQTL lead is in the top 5% by |z_pred|, by LOEUF decile
+        group20 = decile_index(loeuf, genes20.index)
+        summary = fig_fraction_by_group(group20, DECILE_LABELS,
+                                        [('Lead |z_eQTL| > 4', is_egene & (group20 >= 0), lead_top5),
+                                         ('Lead |z_eQTL| ≤ 4', ~is_egene & (group20 >= 0), lead_top5)],
+                                        args.cell_type, 'LOEUF decile (1 = most constrained); genes with ≥ 20 predicted variants',
+                                        'Fraction of genes with eQTL lead in top 5% by |z_pred|',
+                                        '%s_lead_variant_top5_by_loeuf_decile.%s' % (args.output_prefix, fmt),
+                                        ref_line=0.05, ref_label='uniform')
+        print(summary.to_string(index=False), flush=True)
+
+        # 24. Sign concordance among pairs confident on both sides, by LOEUF decile of the gene
+        cat_decile = loeuf['loeuf_decile'].reindex(df['gene_id'].cat.categories).to_numpy(dtype=float)
+        pair_group = np.where(np.isnan(cat_decile), -1, np.nan_to_num(cat_decile, nan=0) - 1).astype(int)[df['gene_id'].cat.codes.to_numpy()]
+        confident_eqtl = (np.abs(z_eqtl) > 4) & (pair_group >= 0)
+        summary = fig_fraction_by_group(pair_group, DECILE_LABELS,
+                                        [('|z_eQTL| > 4, |z_pred| > 3', confident_eqtl & (np.abs(z_pred) > 3), same_sign),
+                                         ('|z_eQTL| > 4, |z_pred| > 5', confident_eqtl & (np.abs(z_pred) > 5), same_sign)],
+                                        args.cell_type, 'LOEUF decile of the gene (1 = most constrained); n pairs below',
+                                        'Fraction of pairs with concordant sign',
+                                        '%s_sign_concordance_by_loeuf_decile.%s' % (args.output_prefix, fmt),
+                                        ref_line=0.5, ref_label='null')
+        print(summary.to_string(index=False), flush=True)
+    else:
+        print("No --loeuf_file given; skipping the LOEUF-decile figures", flush=True)

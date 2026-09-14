@@ -92,21 +92,27 @@ def generate_beta_combined_all_links(fingen_peak_gene_links_file, caqtl_data):
             cross_term = se_caqtl_sq * se_link_sq
             var_pred_k = beta_link_sq * se_caqtl_sq + (beta_caqtl ** 2) * se_link_sq
             if variant_id not in gene_dict:
-                # [beta_pred, var_pred, af, n_peaks, var_pred_unbiased]
-                gene_dict[variant_id] = [beta_pred_k, var_pred_k + cross_term, af, 1, var_pred_k - cross_term]
+                # [beta_pred, var_pred, af, n_peaks, var_pred_unbiased, |top contribution|, beta_caqtl_top, beta_link_top]
+                # The last three track the single peak contributing the largest |beta_caqtl * beta_link| to the sum
+                gene_dict[variant_id] = [beta_pred_k, var_pred_k + cross_term, af, 1, var_pred_k - cross_term,
+                                         abs(beta_pred_k), beta_caqtl, beta_link]
             else:
                 entry = gene_dict[variant_id]
                 entry[0] += beta_pred_k
                 entry[1] += var_pred_k + cross_term
                 entry[3] += 1
                 entry[4] += var_pred_k - cross_term
+                if abs(beta_pred_k) > entry[5]:
+                    entry[5] = abs(beta_pred_k)
+                    entry[6] = beta_caqtl
+                    entry[7] = beta_link
     f.close()
 
     # Convert accumulated variance to standard error
     for gene_id in beta_combined_data:
         gene_dict = beta_combined_data[gene_id]
         for variant_id, entry in gene_dict.items():
-            gene_dict[variant_id] = (entry[0], np.sqrt(entry[1]), entry[2], entry[3], entry[4])
+            gene_dict[variant_id] = (entry[0], np.sqrt(entry[1]), entry[2], entry[3], entry[4], entry[6], entry[7])
     return beta_combined_data
 
 
@@ -122,11 +128,13 @@ def generate_beta_combined(fingen_peak_gene_links_file, caqtl_data, combination_
 def write_beta_combined_output(fingen_eqtl_file, beta_combined_data, output_file):
     # eQTL cis_nominal columns: #CHR, POS, cell_type, phenotype_id, MarkerID, AF_Allele2, BETA, SE, p.value
     # Every variant-gene pair in the eQTL file is written; pairs with no prediction get NA for beta_combined / se_combined /
-    # var_combined_unbiased and 0 for n_peaks
+    # var_combined_unbiased and 0 for n_peaks. beta_caqtl_top / beta_link_top are the components of the peak contributing
+    # the largest |beta_caqtl * beta_link| to the pair's sum (NA when there is no prediction)
     # af is AF_Allele2 from the eQTL file (alternate allele frequency, same orientation as the caQTL af)
     f = gzip.open(fingen_eqtl_file, 'rt')
     t = gzip.open(output_file, 'wt')
-    t.write('\t'.join(['variant_id', 'gene_id', 'beta_eqtl_hat', 'beta_eqtl_se', 'beta_combined', 'se_combined', 'af', 'n_peaks', 'var_combined_unbiased']) + '\n')
+    t.write('\t'.join(['variant_id', 'gene_id', 'beta_eqtl_hat', 'beta_eqtl_se', 'beta_combined', 'se_combined', 'af', 'n_peaks',
+                       'var_combined_unbiased', 'beta_caqtl_top', 'beta_link_top']) + '\n')
     head_count = 0
     line_num = 0
     n_written = 0
@@ -155,19 +163,24 @@ def write_beta_combined_output(fingen_eqtl_file, beta_combined_data, output_file
             continue
 
         if gene_id in beta_combined_data and variant_id in beta_combined_data[gene_id]:
-            beta_combined, se_combined, _, n_peaks, var_unbiased = beta_combined_data[gene_id][variant_id]
+            beta_combined, se_combined, _, n_peaks, var_unbiased, beta_caqtl_top, beta_link_top = beta_combined_data[gene_id][variant_id]
             beta_combined = str(beta_combined)
             se_combined = str(se_combined)
             n_peaks = str(n_peaks)
             var_unbiased = str(var_unbiased)
+            beta_caqtl_top = str(beta_caqtl_top)
+            beta_link_top = str(beta_link_top)
             n_with_prediction += 1
         else:
             beta_combined = "NA"
             se_combined = "NA"
             n_peaks = "0"
             var_unbiased = "NA"
+            beta_caqtl_top = "NA"
+            beta_link_top = "NA"
 
-        t.write('\t'.join([variant_id, gene_id, beta_eqtl_hat, beta_eqtl_se, beta_combined, se_combined, af, n_peaks, var_unbiased]) + '\n')
+        t.write('\t'.join([variant_id, gene_id, beta_eqtl_hat, beta_eqtl_se, beta_combined, se_combined, af, n_peaks, var_unbiased,
+                           beta_caqtl_top, beta_link_top]) + '\n')
         n_written += 1
     f.close()
     t.close()

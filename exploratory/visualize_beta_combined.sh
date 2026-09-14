@@ -9,6 +9,7 @@
 cell_type="${1}"
 pred_beta_combined_dir="${2}"
 visualization_dir="${3}"
+loeuf_file="${4}"
 
 source ~/.bash_profile
 conda activate plink_env
@@ -22,4 +23,5 @@ python visualize_beta_combined.py \
     --beta_combined_file ${beta_combined_file} \
     --cell_type ${cell_type} \
     --n_bins ${n_bins} \
-    --output_prefix ${output_prefix}
+    --output_prefix ${output_prefix} \
+    --loeuf_file ${loeuf_file}
