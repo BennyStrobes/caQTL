@@ -64,4 +64,3 @@ python generate_beta_combined.py \
     --peak_re_scaling_file ${peak_re_scaling_dir}"l1."${cell_type}".rescaling.tsv.gz" \
     --scaling_version ${scaling_version} \
     --output_file ${output_file}
-
