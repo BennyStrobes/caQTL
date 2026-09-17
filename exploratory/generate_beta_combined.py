@@ -5,7 +5,7 @@ import sys
 import pdb
 import gzip
 
-def load_in_caqtl_data(fingen_caqtl_file, peak_to_scaling_factor):
+def load_in_caqtl_data(fingen_caqtl_file, peak_to_scaling_factor, scaling_version):
     f = gzip.open(fingen_caqtl_file, 'rt')
     head_count = 0
     obj = {}
@@ -29,11 +29,18 @@ def load_in_caqtl_data(fingen_caqtl_file, peak_to_scaling_factor):
             print("Peak id %s not found in peak re-scaling file" % peak_id)
             sys.exit(1)
 
-        scaling_factor = peak_to_scaling_factor[peak_id]
+        scaling_factor, a_p, robust_sd_p = peak_to_scaling_factor[peak_id]
 
-
-        beta = float(data[11])*scaling_factor
-        beta_se = float(data[12])*scaling_factor
+        if scaling_version == 'exact_a_p_robust_sd':
+            # Exact (nonlinear) count conversion: delta-count per allele = a_p * (2^(robust_sd_p * beta) - 1), divided by ln2 to
+            # keep the same log2 unit convention as 'a_p_robust_sd' (to which it reduces at first order). SE by the delta method:
+            # d/dbeta [a_p * (2^(s*beta) - 1) / ln2] = a_p * s * 2^(s*beta).
+            beta_raw = float(data[11])
+            beta = a_p*(2.0**(robust_sd_p*beta_raw) - 1.0)/np.log(2.0)
+            beta_se = a_p*robust_sd_p*(2.0**(robust_sd_p*beta_raw))*float(data[12])
+        else:
+            beta = float(data[11])*scaling_factor
+            beta_se = float(data[12])*scaling_factor
         af = float(data[7])
 
         if peak_id not in obj:
@@ -253,7 +260,9 @@ def create_mapping_from_peak_to_scaling_factor(peak_re_scaling_file, scaling_ver
         #     model the a_p in the count conversion cancels the attenuation of the per-count link slope, so this is expected to
         #     be the most stable across peaks.
         # scaling_version == 'none': raw INT-scale beta_caqtl.
-        if scaling_version == 'a_p_robust_sd':
+        # scaling_version == 'exact_a_p_robust_sd': nonlinear per-variant conversion a_p * (2^(robust_sd_p * beta_caqtl) - 1) / ln2,
+        #     done in load_in_caqtl_data (no single per-peak factor); the first-order factor is stored here for reference only.
+        if scaling_version == 'a_p_robust_sd' or scaling_version == 'exact_a_p_robust_sd':
             scaling_factor = a_p*robust_sd_p
         elif scaling_version == 'robust_sd':
             scaling_factor = robust_sd_p
@@ -265,7 +274,7 @@ def create_mapping_from_peak_to_scaling_factor(peak_re_scaling_file, scaling_ver
         if peak_id in mapping:
             print("Duplicate peak_id found in peak re-scaling file: %s" % peak_id)
             sys.exit(1)
-        mapping[peak_id] = scaling_factor
+        mapping[peak_id] = (scaling_factor, a_p, robust_sd_p)
         peak_to_a_p[peak_id] = a_p
         scaling_factors.append(scaling_factor)
     scaling_factors = np.array(scaling_factors)
@@ -377,7 +386,7 @@ if __name__ == '__main__':
     #run_peak_gene_link_sanity_checks(fingen_peak_gene_links_file, peak_to_a_p)
 
     # First load in caqtl effect sizes and standard errors
-    caqtl_data = load_in_caqtl_data(fingen_caqtl_file, peak_to_scaling_factor)
+    caqtl_data = load_in_caqtl_data(fingen_caqtl_file, peak_to_scaling_factor, scaling_version)
 
     # Second load in peak-gene links, and generate beta combined
     beta_combined_data = generate_beta_combined(fingen_peak_gene_links_file, caqtl_data, combination_version)

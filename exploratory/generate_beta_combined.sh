@@ -18,7 +18,7 @@ conda activate plink_env
 
 
 combination_version="all_links_hurdle"
-scaling_version="a_p_robust_sd"  # one of: a_p_robust_sd, robust_sd, none
+scaling_version="exact_a_p_robust_sd"  # one of: exact_a_p_robust_sd, a_p_robust_sd, robust_sd, none
 output_file=${pred_beta_combined_dir}${cell_type}"_beta_combined_"${combination_version}"_"${scaling_version}".tsv.gz"
 python generate_beta_combined.py \
     --fingen_eqtl_file ${fingen_eqtl_dir}"finngen_multiome_v1.eQTL.l1."${cell_type}".cis_nominal.tsv.gz" \
@@ -30,7 +30,7 @@ python generate_beta_combined.py \
     --output_file ${output_file}
 
 combination_version="all_links_hurdle"
-scaling_version="robust_sd"  # one of: a_p_robust_sd, robust_sd, none
+scaling_version="a_p_robust_sd"  # one of: exact_a_p_robust_sd, a_p_robust_sd, robust_sd, none
 output_file=${pred_beta_combined_dir}${cell_type}"_beta_combined_"${combination_version}"_"${scaling_version}".tsv.gz"
 python generate_beta_combined.py \
     --fingen_eqtl_file ${fingen_eqtl_dir}"finngen_multiome_v1.eQTL.l1."${cell_type}".cis_nominal.tsv.gz" \
@@ -42,7 +42,7 @@ python generate_beta_combined.py \
     --output_file ${output_file}
 
 combination_version="all_links_hurdle"
-scaling_version="none"  # one of: a_p_robust_sd, robust_sd, none
+scaling_version="robust_sd"  # one of: exact_a_p_robust_sd, a_p_robust_sd, robust_sd, none
 output_file=${pred_beta_combined_dir}${cell_type}"_beta_combined_"${combination_version}"_"${scaling_version}".tsv.gz"
 python generate_beta_combined.py \
     --fingen_eqtl_file ${fingen_eqtl_dir}"finngen_multiome_v1.eQTL.l1."${cell_type}".cis_nominal.tsv.gz" \
@@ -52,3 +52,16 @@ python generate_beta_combined.py \
     --peak_re_scaling_file ${peak_re_scaling_dir}"l1."${cell_type}".rescaling.tsv.gz" \
     --scaling_version ${scaling_version} \
     --output_file ${output_file}
+
+combination_version="all_links_hurdle"
+scaling_version="none"  # one of: exact_a_p_robust_sd, a_p_robust_sd, robust_sd, none
+output_file=${pred_beta_combined_dir}${cell_type}"_beta_combined_"${combination_version}"_"${scaling_version}".tsv.gz"
+python generate_beta_combined.py \
+    --fingen_eqtl_file ${fingen_eqtl_dir}"finngen_multiome_v1.eQTL.l1."${cell_type}".cis_nominal.tsv.gz" \
+    --fingen_caqtl_file ${fingen_caqtl_dir}"finngen_multiome_v1.caQTL.l1."${cell_type}".cis_nominal.tsv.gz" \
+    --fingen_peak_gene_links_file ${fingen_peak_gene_links_dir}"finngen_multiome_v1.peak_gene_links.l1."${cell_type}".tsv.gz" \
+    --combination_version ${combination_version} \
+    --peak_re_scaling_file ${peak_re_scaling_dir}"l1."${cell_type}".rescaling.tsv.gz" \
+    --scaling_version ${scaling_version} \
+    --output_file ${output_file}
+
