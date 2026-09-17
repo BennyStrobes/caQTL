@@ -84,8 +84,14 @@ def load_pairs_with_prediction(beta_combined_file):
     if len(chunks) == 0:
         return pd.DataFrame(columns=cols + ['z_eqtl', 'z_pred']), gene_all
     df = pd.concat(chunks, ignore_index=True)
-    # Drop pairs with a zero standard error, which would give infinite z-scores
-    df = df[(df['beta_eqtl_se'] > 0) & (df['se_combined'] > 0)].reset_index(drop=True)
+    # Drop pairs with a zero standard error, which would give infinite z-scores, and pairs with a non-finite SE or
+    # unbiased variance (an infinite link SE gives se_combined = inf and var_combined_unbiased = inf - inf = NaN)
+    n_before = len(df)
+    keep = (df['beta_eqtl_se'] > 0) & (df['se_combined'] > 0) & np.isfinite(df['se_combined'])
+    if has_unbiased:
+        keep = keep & np.isfinite(df['var_combined_unbiased'])
+    df = df[keep].reset_index(drop=True)
+    print("pairs with prediction dropped for zero or non-finite SE / variance: %d" % (n_before - len(df)), flush=True)
     df['n_peaks'] = df['n_peaks'].astype(int)
     df['gene_id'] = df['gene_id'].astype('category')
     if not has_unbiased:
@@ -202,9 +208,10 @@ def style_axes(ax):
 
 
 def draw_bin_scatter(ax, summary, n_bins, color=SERIES[0]):
-    # Smaller marks once the bins get dense
-    markersize = 6.5 if n_bins <= 20 else 4
+    # Smaller marks once the bins get dense; white ring so overlapping marks stay distinct
+    markersize = 6.5 if n_bins <= 20 else 4.5
     capsize = 2 if n_bins <= 20 else 1
+    ax.grid(True, color=GRID_GRAY, linewidth=0.5, alpha=0.6, zorder=0)
     ax.axhline(0, color=GRID_GRAY, linewidth=1, zorder=0)
     ax.axvline(0, color=GRID_GRAY, linewidth=1, zorder=0)
     ax.errorbar(summary['x_mean'], summary['y_mean'], xerr=summary['x_ci95'], yerr=summary['y_ci95'],
@@ -219,17 +226,60 @@ def summary_path(output_file):
 ########################
 # Figures
 ########################
-def fig_bin_scatter(x, y, n_bins, cell_type, xlabel, ylabel, output_file):
-    # Mean y vs mean x within equal-count bins of x
+def symlog_threshold(v):
+    # Linear window half-width for a symlog axis: the smallest nonzero |value|, so every point sits in the log region
+    a = np.abs(np.asarray(v, dtype=float))
+    a = a[a > 0]
+    return a.min() if len(a) > 0 else 1.0
+
+
+def fig_bin_scatter(x, y, n_bins, cell_type, xlabel, ylabel, output_file, symlog=False, linthresh=(5e-5, 5e-4), fit_line=True,
+                    subtitle=None):
+    # Mean y vs mean x within equal-count bins of x, with the OLS fit of y on x over all supplied pairs (not the bin means).
+    # With symlog, both axes are log-distance from zero (linear inside +/- linthresh), with ticks in the original units,
+    # and the fit is a power law to the bin means, which is a straight line on those axes.
     bins = equal_count_bins(x, n_bins)
     summary = bin_means(x, y, bins, n_bins)
     summary.to_csv(summary_path(output_file), sep='\t', index=False)
+    slope, slope_se = ols_slope(x, y)
+    intercept = y.mean() - slope * x.mean()
 
-    fig, ax = plt.subplots(figsize=(5.8, 4.8))
+    fig, ax = plt.subplots(figsize=(5.8, 5.0))
     draw_bin_scatter(ax, summary, n_bins)
+    xm, ym = summary['x_mean'].to_numpy(), summary['y_mean'].to_numpy()
+    fit_label = None
+    if symlog:
+        # log10|y| = a + b log10|x| over bins outside the linear window with matching signs; b ~ 1 means linear with scale factor c
+        use = (np.abs(xm) > linthresh[0]) & (np.abs(ym) > linthresh[1]) & (np.sign(xm) == np.sign(ym))
+        b, b_se = ols_slope(np.log10(np.abs(xm[use])), np.log10(np.abs(ym[use])))
+        a = np.log10(np.abs(ym[use])).mean() - b * np.log10(np.abs(xm[use])).mean()
+        fit_label = 'Power-law fit to %d bins: |y| = %.2f |x|$^{%.2f}$ (exponent SE %.2f)' % (use.sum(), 10 ** a, b, b_se)
+        for sign, edge in [(-1, -xm.min()), (1, xm.max())]:
+            xs = np.logspace(np.log10(linthresh[0]), np.log10(edge), 200)
+            ax.plot(sign * xs, sign * 10 ** a * xs ** b, color=SERIES[1], linewidth=1.5, zorder=2,
+                    label=fit_label if sign == 1 else None)
+        ax.set_xscale('symlog', linthresh=linthresh[0], linscale=0.3)
+        ax.set_yscale('symlog', linthresh=linthresh[1], linscale=0.3)
+        # Decade ticks outside the linear window only, plus zero, so labels do not collide around the origin
+        for axis, thresh, vmax in [(ax.xaxis, linthresh[0], np.abs(xm).max()), (ax.yaxis, linthresh[1], np.abs(ym).max())]:
+            decades = 10.0 ** np.arange(np.ceil(np.log10(thresh)), np.floor(np.log10(vmax)) + 1)
+            axis.set_ticks(np.concatenate([-decades[::-1], [0], decades]))
+            axis.set_minor_locator(matplotlib.ticker.NullLocator())
+    elif fit_line:
+        fit_label = 'OLS fit over %s pairs: slope = %.2f (SE %.2f)' % (compact(len(x)), slope, slope_se)
+        xs = np.linspace(xm.min(), xm.max(), 400)
+        ax.plot(xs, intercept + slope * xs, color=SERIES[1], linewidth=1.5, zorder=2, label=fit_label)
+    if fit_label is not None:
+        leg = ax.legend(loc='upper left', fontsize=8, frameon=False, handlelength=1.6)
+        for t in leg.get_texts():
+            t.set_color(INK_SECONDARY)
+    ax.margins(0.06)
     ax.set_xlabel(xlabel, color=INK)
     ax.set_ylabel(ylabel, color=INK)
-    ax.set_title('%s cells' % cell_type, fontsize=10, color=INK)
+    if subtitle is None:
+        subtitle = '%s pairs in %d equal-count bins; bars are 95%% CIs of bin means' % (compact(len(x)), n_bins)
+    ax.set_title('%s cells' % cell_type, fontsize=10, color=INK, loc='left', pad=18)
+    ax.text(0, 1.012, subtitle, transform=ax.transAxes, fontsize=8, color=INK_SECONDARY, va='bottom', ha='left')
     style_axes(ax)
     fig.tight_layout()
     fig.savefig(output_file)
@@ -356,7 +406,8 @@ def fig_pvalue_histograms(p_eqtl, p_pred, cell_type, output_file, n_bins=50):
     return summary
 
 
-def fig_effect_size_density(x, y, cell_type, output_file, n_bins=400, note=None):
+def fig_effect_size_density(x, y, cell_type, output_file, n_bins=400, note=None, fit_line=True,
+                            xlabel='Predicted eQTL effect (Σ β_caQTL × β_link)', ylabel='Observed eQTL effect (β_eQTL)'):
     # Scatter of every pair rendered as a 2D histogram with a log color scale (a point scatter of
     # tens of millions of pairs is unreadable and enormous); axes trimmed to the central quantile range
     q = SCATTER_TAIL_QUANTILE
@@ -366,7 +417,8 @@ def fig_effect_size_density(x, y, cell_type, output_file, n_bins=400, note=None)
     n_outside = len(x) - int(counts.sum())
 
     cmap = matplotlib.colors.LinearSegmentedColormap.from_list('seq_blue', ['#d6e6f7', SERIES[0], '#0a2d5e'])
-    fig, ax = plt.subplots(figsize=(6.2, 5.0))
+    fig, ax = plt.subplots(figsize=(6.2, 5.2))
+    ax.grid(True, color=GRID_GRAY, linewidth=0.5, alpha=0.6, zorder=0)
     ax.axhline(0, color=GRID_GRAY, linewidth=1, zorder=0)
     ax.axvline(0, color=GRID_GRAY, linewidth=1, zorder=0)
     masked = np.ma.masked_where(counts.T == 0, counts.T)
@@ -377,11 +429,24 @@ def fig_effect_size_density(x, y, cell_type, output_file, n_bins=400, note=None)
     cbar.set_label('Variant-gene pairs per cell', color=INK, fontsize=9)
     cbar.ax.tick_params(colors=INK_SECONDARY, labelsize=8)
     cbar.outline.set_edgecolor(GRID_GRAY)
-    ax.set_xlabel('Predicted eQTL effect (Σ β_caQTL × β_link)', color=INK)
-    ax.set_ylabel('Observed eQTL effect (β_eQTL)', color=INK)
-    ax.set_title('%s cells' % cell_type, fontsize=10, color=INK)
+    if fit_line:
+        # OLS of observed on predicted over the shown pairs. Selecting on |z_pred| is selection on x, which leaves this
+        # regression unbiased apart from errors-in-variables attenuation; selecting on |z_eQTL| as well biases it upward.
+        slope, slope_se = ols_slope(x, y)
+        intercept = y.mean() - slope * x.mean()
+        xs = np.array(xlim)
+        ax.plot(xs, intercept + slope * xs, color=SERIES[1], linewidth=1.5, zorder=3,
+                label='OLS fit: slope = %.2f (SE %.2f)' % (slope, slope_se))
+        leg = ax.legend(loc='upper left', fontsize=8, frameon=False, handlelength=1.6)
+        for t in leg.get_texts():
+            t.set_color(INK_SECONDARY)
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    ax.set_xlabel(xlabel, color=INK)
+    ax.set_ylabel(ylabel, color=INK)
+    ax.set_title('%s cells' % cell_type, fontsize=10, color=INK, loc='left', pad=18 if note is not None else 6)
     if note is not None:
-        ax.text(0.02, 0.98, note, transform=ax.transAxes, fontsize=8, color=INK_SECONDARY, va='top', zorder=5)
+        ax.text(0, 1.012, note, transform=ax.transAxes, fontsize=8, color=INK_SECONDARY, va='bottom', ha='left')
     style_axes(ax)
     fig.tight_layout()
     fig.savefig(output_file, dpi=200)
@@ -806,9 +871,26 @@ def moment_correlation(x, y, var_x, var_y, n_blocks=200):
     return out
 
 
-def fig_moment_correlation(df, cell_type, output_file):
+def fig_moment_correlation(df, cell_type, output_file, loeuf=None):
     # Noise-corrected correlation of true predicted vs observed eQTL effects, with sensitivity analyses:
     # trimming extreme predicted effects, and stratifying by minor allele frequency and number of peaks.
+    # Short-term stand-in for the se_link filter in generate_beta_combined.py, for output files written before it existed:
+    # a legitimate link SE (< ~5 per read) gives a prediction SE of order 0.01, so se_combined above max_se_pred can only
+    # come from a degenerate link fit. This is a fit-quality filter, not selection on the effect.
+    # Sensitivity of the all-pairs estimate to the cap. A cap at which r_true stops moving is one that has removed the
+    # noise tail without removing signal; the main table below uses max_se_pred.
+    print("Moment correlation, all pairs, by cap on se_combined:", flush=True)
+    for cap in [1.0, 0.3, 0.1, 0.03, 0.01]:
+        k = (df['se_combined'] <= cap).to_numpy()
+        m = moment_correlation(df.loc[k, 'beta_combined'].to_numpy(), df.loc[k, 'beta_eqtl_hat'].to_numpy(),
+                               df.loc[k, 'var_combined_unbiased'].to_numpy(), df.loc[k, 'beta_eqtl_se'].to_numpy() ** 2)
+        print("  cap %.2f: n = %d (dropped %d), r_naive = %.3f, r_true = %.3f (se %.3f), slope_true = %.2f, reliability_x = %.3f"
+              % (cap, m['n'], len(df) - m['n'], m['r_naive'], m['r_true'], m['r_true_se'], m['slope_true'], m['reliability_x']), flush=True)
+    max_se_pred = 0.1
+    keep = (df['se_combined'] <= max_se_pred).to_numpy()
+    print("Moment correlation: dropping %d of %d pairs with se_combined > %.1f (degenerate link fits)"
+          % ((~keep).sum(), len(df), max_se_pred), flush=True)
+    df = df[keep]
     x = df['beta_combined'].to_numpy()
     y = df['beta_eqtl_hat'].to_numpy()
     vx = df['var_combined_unbiased'].to_numpy()
@@ -816,6 +898,15 @@ def fig_moment_correlation(df, cell_type, output_file):
     af = df['af'].to_numpy()
     maf = np.minimum(af, 1 - af)
     n_peaks = df['n_peaks'].to_numpy()
+
+    # Diagnostic for reliability_x: var(x) must exceed mean(var_x). Report how concentrated the error variance is:
+    # if the top 0.1% of pairs carry most of the mean, a few links with huge SEs are driving the correction
+    order = np.argsort(vx)[::-1]
+    top = int(np.ceil(len(vx) * 0.001))
+    print("Noise-model diagnostic (all pairs): var(beta_combined) = %.3e, mean(var_combined_unbiased) = %.3e, "
+          "median = %.3e, 99th pct = %.3e, 99.9th pct = %.3e, share of sum(var_x) in top 0.1%% of pairs = %.3f"
+          % (np.var(x), np.mean(vx), np.median(vx), np.percentile(vx, 99), np.percentile(vx, 99.9),
+             vx[order[:top]].sum() / vx.sum()), flush=True)
 
     # Sensitivity rows stratify on covariates only (MAF, n_peaks), never on the estimated effect or its SE: selecting
     # on a noisy estimate removes real variance while the noise correction stays, and the prediction's SE is itself a
@@ -825,6 +916,12 @@ def fig_moment_correlation(df, cell_type, output_file):
         analyses.append(('MAF %g–%g' % (lo, hi), (maf >= lo) & (maf < hi) if hi < 0.5 else (maf >= lo)))
     for lo, hi in [(1, 3), (3, 11), (11, np.inf)]:
         analyses.append(('n_peaks %s' % ('%d+' % lo if np.isinf(hi) else '%d–%d' % (lo, hi - 1)), (n_peaks >= lo) & (n_peaks < hi)))
+    if loeuf is not None:
+        # Gene constraint is a gene-level covariate, so stratifying on it is legitimate; -1 = gene without a LOEUF value
+        decile = decile_index(loeuf, pd.Index(df['gene_id'].astype(str))) + 1
+        print("Moment correlation: %d of %d pairs have a LOEUF decile" % (int((decile > 0).sum()), len(decile)), flush=True)
+        for lo, hi in [(1, 2), (3, 5), (6, 10)]:
+            analyses.append(('LOEUF decile %d–%d' % (lo, hi), (decile >= lo) & (decile <= hi)))
 
     rows = []
     for name, mask in analyses:
@@ -1140,11 +1237,15 @@ if __name__ == '__main__':
                               'Mean predicted eQTL effect (Σ β_caQTL × β_link)', 'Mean observed eQTL effect (β_eQTL)',
                               '%s_%s_scatter.%s' % (args.output_prefix, label, fmt))
     print(summary.to_string(index=False), flush=True)
+    # 1b. Same, with both axes on a symlog scale (log-distance from zero, original units)
+    fig_bin_scatter(beta_pred, beta_eqtl, args.n_bins, args.cell_type,
+                    'Mean predicted eQTL effect (Σ β_caQTL × β_link)', 'Mean observed eQTL effect (β_eQTL)',
+                    '%s_%s_scatter_symlog.%s' % (args.output_prefix, label, fmt), symlog=True)
 
     # 2. Same thing on z-scores: observed z vs predicted z, by bin of predicted z
     fig_bin_scatter(z_pred, z_eqtl, args.n_bins, args.cell_type,
                     'Mean predicted z (β_combined / SE_combined)', 'Mean observed eQTL z (β_eQTL / SE_eQTL)',
-                    '%s_z_%s_scatter.%s' % (args.output_prefix, label, fmt))
+                    '%s_z_%s_scatter.%s' % (args.output_prefix, label, fmt), fit_line=False)
 
     # 3. Observed vs predicted effect, restricted to increasingly confident predictions
     summary = fig_bin_scatter_by_confidence(df, Z_THRESHOLDS, args.n_bins_stratified, args.cell_type,
@@ -1200,14 +1301,27 @@ if __name__ == '__main__':
         else:
             print("No pairs with |z| > %g in both the prediction and the eQTL; skipping that scatter" % t, flush=True)
 
-    # 10. Same scatter restricted to confident predictions only (|z_pred| > 5), with no restriction on the eQTL z
-    confident_pred = np.abs(z_pred) > 5
-    if confident_pred.sum() > 1:
-        fig_effect_size_density(beta_pred[confident_pred], beta_eqtl[confident_pred], args.cell_type,
-                                '%s_effect_size_scatter_pred_z5.png' % args.output_prefix,
-                                note='|z_pred| > 5 (no restriction on z_eQTL), n = %s pairs' % format(int(confident_pred.sum()), ','))
-    else:
-        print("No pairs with |z_pred| > 5; skipping that scatter", flush=True)
+    # 10. Same scatter restricted to confident predictions only, with no restriction on the eQTL z
+    for t in [5, 8]:
+        confident_pred = np.abs(z_pred) > t
+        if confident_pred.sum() > 2:
+            fig_effect_size_density(beta_pred[confident_pred], beta_eqtl[confident_pred], args.cell_type,
+                                    '%s_effect_size_scatter_pred_z%g.png' % (args.output_prefix, t),
+                                    note='|z_pred| > %g (no restriction on z_eQTL), n = %s pairs' % (t, format(int(confident_pred.sum()), ',')))
+        else:
+            print("No pairs with |z_pred| > %g; skipping that scatter" % t, flush=True)
+
+    # 10b. Density scatter of z-scores (unit-free): all pairs, then restricted to confident predictions only
+    z_labels_xy = dict(xlabel='Predicted z (β_combined / SE_combined)', ylabel='Observed eQTL z (β_eQTL / SE_eQTL)')
+    fig_effect_size_density(z_pred, z_eqtl, args.cell_type, '%s_z_scatter.png' % args.output_prefix,
+                            note='All pairs with a prediction, n = %s' % format(len(z_pred), ','), **z_labels_xy)
+    for t in [5, 8]:
+        confident_pred = np.abs(z_pred) > t
+        if confident_pred.sum() > 2:
+            fig_effect_size_density(z_pred[confident_pred], z_eqtl[confident_pred], args.cell_type,
+                                    '%s_z_scatter_pred_z%g.png' % (args.output_prefix, t),
+                                    note='|z_pred| > %g (no restriction on z_eQTL), n = %s pairs' % (t, format(int(confident_pred.sum()), ',')),
+                                    **z_labels_xy)
 
     # 11. Reverse of figure 5: fraction of pairs with a confident prediction, by |z_eQTL| bin
     z_eqtl_group = np.digitize(np.abs(z_eqtl), Z_EDGES[1:-1])
@@ -1266,12 +1380,12 @@ if __name__ == '__main__':
     print(summary.to_string(index=False), flush=True)
 
     # 19. Noise-corrected correlation of true predicted vs observed effects (method of moments, block jackknife)
-    summary = fig_moment_correlation(df, args.cell_type, '%s_moment_correlation.%s' % (args.output_prefix, fmt))
+    loeuf = load_loeuf_deciles(args.loeuf_file, gene_all.index) if args.loeuf_file is not None else None
+    summary = fig_moment_correlation(df, args.cell_type, '%s_moment_correlation.%s' % (args.output_prefix, fmt), loeuf=loeuf)
     print(summary[['n', 'r_naive', 'r_true', 'r_true_se', 'slope_true', 'slope_true_se', 'reliability_x', 'reliability_y']].to_string(), flush=True)
 
     # 20-24. Gene constraint (LOEUF decile) analyses; all use per-gene Bonferroni calls rather than a fixed |z| cutoff
     if args.loeuf_file is not None:
-        loeuf = load_loeuf_deciles(args.loeuf_file, gene_all.index)
         alpha = BONF_ALPHAS[0]
         calls = gene_calls(genes, gene_all, alpha)
         genes = genes.join(loeuf).join(calls[['eqtl_p_bonf', 'eqtl_call', 'pred_p_bonf', 'pred_call']])

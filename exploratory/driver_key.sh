@@ -17,6 +17,9 @@ fingen_peak_gene_links_dir=${fingen_data_dir}"peak_gene_links/"
 # LOEUF file
 loeuf_file="/lab-share/CHIP-Strober-e2/Public/gene_annotation_files/gnomad.v4.1.constraint_metrics.tsv"
 
+# Directory containing re-scaling information for peak data
+peak_re_scaling_dir="/lab-share/CHIP-Strober-e2/Public/finngen/public_multiome/rescaling_data_from_masa/"
+
 ###############
 # Output directories
 ###############
@@ -35,10 +38,14 @@ visualization_dir=${output_root}"visualizations/"
 # Code
 ###############
 
+cell_type="CD4_T"
+if false; then
+sbatch generate_beta_combined.sh ${cell_type} ${fingen_eqtl_dir} ${fingen_caqtl_dir} ${fingen_peak_gene_links_dir} ${pred_beta_combined_dir} $peak_re_scaling_dir
+fi
 
 # First create beta combined for each cell type
 if false; then
-for cell_type in "B" "CD4_T" "Mono"; do
+for cell_type in "CD4_T" "Mono"; do
     sbatch generate_beta_combined.sh ${cell_type} ${fingen_eqtl_dir} ${fingen_caqtl_dir} ${fingen_peak_gene_links_dir} ${pred_beta_combined_dir}
 done
 fi
@@ -46,12 +53,12 @@ fi
 
 # Second, plot observed vs chromatin-predicted eqtl effects by percentile of predicted effect
 if false; then
-for cell_type in "B" "CD4_T" "Mono"; do
+for cell_type in "CD4_T" "Mono"; do
     sh visualize_beta_combined.sh ${cell_type} ${pred_beta_combined_dir} ${visualization_dir} ${loeuf_file}
 done
 fi
 
-cell_type="B"
+if false; then
+cell_type="CD4_T"
     sh visualize_beta_combined.sh ${cell_type} ${pred_beta_combined_dir} ${visualization_dir} ${loeuf_file}
-
-
+fi

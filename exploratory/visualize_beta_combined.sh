@@ -14,14 +14,43 @@ loeuf_file="${4}"
 source ~/.bash_profile
 conda activate plink_env
 
-
-combination_version="all_links"
-beta_combined_file=${pred_beta_combined_dir}${cell_type}"_beta_combined_"${combination_version}".tsv.gz"
+if false; then
+combination_version="all_links_hurdle"
+scaling_version="robust_sd"  # one of: a_p_robust_sd, robust_sd, none
+beta_combined_file=${pred_beta_combined_dir}${cell_type}"_beta_combined_"${combination_version}"_"${scaling_version}".tsv.gz"
 n_bins="50"
-output_prefix=${visualization_dir}${cell_type}"_beta_combined_"${combination_version}
+output_prefix=${visualization_dir}${cell_type}"_beta_combined_"${combination_version}"_"${scaling_version}
 python visualize_beta_combined.py \
     --beta_combined_file ${beta_combined_file} \
     --cell_type ${cell_type} \
     --n_bins ${n_bins} \
     --output_prefix ${output_prefix} \
     --loeuf_file ${loeuf_file}
+fi
+
+combination_version="all_links_hurdle"
+scaling_version="a_p_robust_sd"  # one of: a_p_robust_sd, robust_sd, none
+beta_combined_file=${pred_beta_combined_dir}${cell_type}"_beta_combined_"${combination_version}"_"${scaling_version}".tsv.gz"
+n_bins="50"
+output_prefix=${visualization_dir}${cell_type}"_beta_combined_"${combination_version}"_"${scaling_version}
+python visualize_beta_combined.py \
+    --beta_combined_file ${beta_combined_file} \
+    --cell_type ${cell_type} \
+    --n_bins ${n_bins} \
+    --output_prefix ${output_prefix} \
+    --loeuf_file ${loeuf_file}
+
+
+if false; then
+combination_version="all_links_hurdle"
+scaling_version="none"  # one of: a_p_robust_sd, robust_sd, none
+beta_combined_file=${pred_beta_combined_dir}${cell_type}"_beta_combined_"${combination_version}"_"${scaling_version}".tsv.gz"
+n_bins="50"
+output_prefix=${visualization_dir}${cell_type}"_beta_combined_"${combination_version}"_"${scaling_version}
+python visualize_beta_combined.py \
+    --beta_combined_file ${beta_combined_file} \
+    --cell_type ${cell_type} \
+    --n_bins ${n_bins} \
+    --output_prefix ${output_prefix} \
+    --loeuf_file ${loeuf_file}
+fi
