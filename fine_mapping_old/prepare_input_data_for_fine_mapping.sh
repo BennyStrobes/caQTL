@@ -11,9 +11,8 @@ peak_gene_links_file=${3}
 fingen_ld_dir=${4}
 cell_type=${5}
 gene_annotation_file=${6}
-caqtl_rescaling_file=${7}
-sum_stats_fm_input_dir=${8}
-LD_fm_input_dir=${9}
+sum_stats_fm_input_dir=${7}
+LD_fm_input_dir=${8}
 
 
 date
@@ -21,7 +20,7 @@ date
 source ~/.bash_profile
 conda activate plink_env
 
-python prepare_input_data_for_fine_mapping.py --eqtl_file ${eqtl_file} --caqtl_file ${caqtl_file} --peak_gene_links_file ${peak_gene_links_file} --caqtl_rescaling_file ${caqtl_rescaling_file} --fingen_ld_dir ${fingen_ld_dir} --cell_type ${cell_type} --gene_annotation_file ${gene_annotation_file} --sum_stats_fm_input_dir ${sum_stats_fm_input_dir} --LD_fm_input_dir ${LD_fm_input_dir}
+python prepare_input_data_for_fine_mapping.py --eqtl_file ${eqtl_file} --caqtl_file ${caqtl_file} --peak_gene_links_file ${peak_gene_links_file} --fingen_ld_dir ${fingen_ld_dir} --cell_type ${cell_type} --gene_annotation_file ${gene_annotation_file} --sum_stats_fm_input_dir ${sum_stats_fm_input_dir} --LD_fm_input_dir ${LD_fm_input_dir}
 
 
 date

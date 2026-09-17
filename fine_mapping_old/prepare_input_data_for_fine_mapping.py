@@ -5,7 +5,6 @@ import numpy as np
 import gzip
 import os
 import subprocess
-from scipy.stats import chi2
 
 def create_ensamble_id_to_chrom_and_tss_mapping(gene_annotation_file):
     # Returns dictionary mapping ensamble id (gene_id in gtf with version removed, e.g. ENSG00000223972) to (chrom_num, tss)
@@ -134,13 +133,7 @@ def generate_eqtl_sumstats(eqtl_file, ens_id_to_chrom_num_and_tss, sum_stats_fm_
 
 def load_peak_gene_links(peak_gene_links_file, gene_ids):
     # Returns dictionary mapping gene id to list of (peak_id, beta_link, se_link) for genes in gene_ids
-    # hurdle_combined link version (as in exploratory/generate_beta_combined.py):
-    #   beta_link = beta_count + (1 - p) * beta_zero, p = expr_cell_num / total_cell_num
-    #   se_link^2 = se_count^2 + (1 - p)^2 * se_zero^2 (components treated as independent)
-    # Links with non-finite or > max_se_link se_link are thrown out: degenerate fits (e.g. near-separated logistic zero
-    # component) give infinite or absurd SEs, and counts are ~0/1 so an SE above 1 per read cannot come from a real fit
-    max_se_link = 1.0
-    n_links_bad_se = 0
+    # beta_link / se_link are from the negative binomial count component of the hurdle model (as in exploratory analysis)
     gene_id_to_links = {}
     seen_links = {}
     genes_in_file = {}  # all gene ids in links file (including NA rows), for diagnostics
@@ -154,22 +147,14 @@ def load_peak_gene_links(peak_gene_links_file, gene_ids):
             print('peak-gene links file header: ' + ' '.join(header))
             beta_link_col = header.index('hurdle_count_beta')
             se_link_col = header.index('hurdle_count_se')
-            beta_zero_col = header.index('hurdle_zero_beta')
-            se_zero_col = header.index('hurdle_zero_se')
-            total_cell_col = header.index('total_cell_num')
-            expr_cell_col = header.index('expr_cell_num')
             continue
         peak_id = data[0]
         gene_id = data[1]
         genes_in_file[gene_id] = True
-        if data[beta_link_col] == 'NA' or data[se_link_col] == 'NA' or data[beta_zero_col] == 'NA' or data[se_zero_col] == 'NA':
+        if data[beta_link_col] == 'NA' or data[se_link_col] == 'NA':
             continue
-        p_expr = float(data[expr_cell_col]) / float(data[total_cell_col])
-        beta_link = float(data[beta_link_col]) + (1.0 - p_expr) * float(data[beta_zero_col])
-        se_link = np.sqrt(float(data[se_link_col]) ** 2 + ((1.0 - p_expr) ** 2) * (float(data[se_zero_col]) ** 2))
-        if not (np.isfinite(beta_link) and np.isfinite(se_link)) or se_link > max_se_link:
-            n_links_bad_se += 1
-            continue
+        beta_link = float(data[beta_link_col])
+        se_link = float(data[se_link_col])
         if (peak_id, gene_id) in seen_links:
             print('assumption error: duplicate peak-gene pair ' + peak_id + ' ' + gene_id)
             pdb.set_trace()
@@ -192,16 +177,15 @@ def load_peak_gene_links(peak_gene_links_file, gene_ids):
     for gene_id in genes_in_file:
         if gene_id not in gene_ids:
             n_file_genes_not_in_eqtl += 1
-    print('peak-gene links removed for non-finite or > ' + str(max_se_link) + ' se_link: ' + str(n_links_bad_se))
     print('peak-gene links file: ' + str(len(genes_in_file)) + ' genes total, ' + str(n_file_genes_not_in_eqtl) + ' not among eqtl genes')
     print('eqtl genes: ' + str(len(gene_ids)) + ' total, ' + str(n_eqtl_genes_not_in_file) + ' absent from links file, ' + str(n_eqtl_genes_na_only) + ' present but only NA links')
     return gene_id_to_links
 
 
-def load_caqtl_sumstats(caqtl_file, needed_peaks, needed_variants, peak_to_scaling_factor):
+def load_caqtl_sumstats(caqtl_file, needed_peaks, needed_variants):
     # Returns dictionary mapping peak id to dictionary mapping variant id to (beta_std, se_std)
     # Only peaks in needed_peaks and variants in needed_variants are kept (to limit memory)
-    # Column indices and peak-specific re-scaling of beta / se follow exploratory/generate_beta_combined.py
+    # Column indices follow exploratory/generate_beta_combined.py
     peak_id_to_caqtl_sumstats = {}
     f = gzip.open(caqtl_file, 'rt')
     head_count = 0
@@ -224,13 +208,9 @@ def load_caqtl_sumstats(caqtl_file, needed_peaks, needed_variants, peak_to_scali
             continue
         if data[11] == 'NA' or data[12] == 'NA':
             continue
-        if peak_id not in peak_to_scaling_factor:
-            print('assumption error: peak ' + peak_id + ' not found in peak re-scaling file')
-            pdb.set_trace()
-        scaling_factor = peak_to_scaling_factor[peak_id]
         allele_frequency = float(data[7])
-        beta = float(data[11]) * scaling_factor
-        se = float(data[12]) * scaling_factor
+        beta = float(data[11])
+        se = float(data[12])
         # Standardize effect sizes to per-genotype-SD scale (genotype variance = 2p(1-p) under HWE)
         genotype_sd = np.sqrt(2.0 * allele_frequency * (1.0 - allele_frequency))
         beta_std = beta * genotype_sd
@@ -267,8 +247,7 @@ def load_eqtl_summary_file(eqtl_summary_file):
     return gene_id_to_eqtl_sumstats
 
 
-
-def generate_caqtl_and_peak_gene_link_sumstats(eqtl_summary_file, caqtl_file, peak_gene_links_file, sum_stats_fm_input_dir, cell_type, min_peak_variant_coverage, caqtl_mediated_summary_file, peak_to_scaling_factor):
+def generate_caqtl_and_peak_gene_link_sumstats(eqtl_summary_file, caqtl_file, peak_gene_links_file, sum_stats_fm_input_dir, cell_type, min_peak_variant_coverage, caqtl_mediated_summary_file):
     # For each gene in eqtl summary file, build fine-mapping simulation-formatted objects:
     #   caqtl effects / ses: (K peaks x p variants) matrices on standardized-genotype scale
     #   peak-gene effects / ses: (K,) vectors
@@ -294,7 +273,7 @@ def generate_caqtl_and_peak_gene_link_sumstats(eqtl_summary_file, caqtl_file, pe
             needed_variants[variant_id] = True
 
     # Load caqtl sumstats
-    peak_id_to_caqtl_sumstats = load_caqtl_sumstats(caqtl_file, needed_peaks, needed_variants, peak_to_scaling_factor)
+    peak_id_to_caqtl_sumstats = load_caqtl_sumstats(caqtl_file, needed_peaks, needed_variants)
     print(str(len(peak_id_to_caqtl_sumstats)) + ' of ' + str(len(needed_peaks)) + ' linked peaks have caqtl sumstats')
 
     n_genes_written = 0
@@ -673,163 +652,6 @@ def generate_fine_mapping_input(caqtl_mediated_summary_file, fingen_ld_dir, sum_
     print('LD regularization s: median ' + str(np.median(ld_s_all)) + ', 90th pct ' + str(np.percentile(ld_s_all, 90)) + ', max ' + str(np.max(ld_s_all)) + ' (floor ' + str(ld_regularization_floor) + ')')
     return
 
-def create_mapping_from_peak_to_scaling_factor(peak_re_scaling_file, scaling_version):
-    mapping = {}
-    peak_to_a_p = {}
-    f = gzip.open(peak_re_scaling_file, 'rt')
-    scaling_factors = []
-    head_count = 0
-    for line in f:
-        if head_count == 0:
-            head_count += 1
-            header = np.copy(line.strip().split('\t'))
-            continue
-        data = line.strip().split('\t')
-        if len(data) != len(header):
-            print("Line in peak re-scaling file has different number of columns than header: %s" % line.strip())
-            sys.exit(1)
-        peak_id = data[2]
-        a_p = float(data[15]) # Mean ATAC counts per nucleus in the peak (across all nuclei in the cell type))
-        robust_sd_p = float(data[11]) # Robust across-donor standard deviation of the pre-INT accessibility phenotype for that peak
-        sd_p = float(data[8]) # Across-donor standard deviation of the pre-INT accessibility phenotype for that peak
-        # scaling_version == 'a_p_robust_sd': delta-count per allele (first order) is ln2 * a_p * robust_sd_p * beta_caqtl.
-        #     beta_link is a per-count slope on natural-log expression, so the product is in ln units; dividing by ln2 to put it
-        #     on the log2 scale of the pre-INT eQTL phenotype cancels the ln2 here. Multiply by ln2 to recover natural-log units.
-        # scaling_version == 'robust_sd': beta_caqtl in log2 accessibility units (no count conversion). Under a sparse 0/1 count
-        #     model the a_p in the count conversion cancels the attenuation of the per-count link slope, so this is expected to
-        #     be the most stable across peaks.
-        # scaling_version == 'none': raw INT-scale beta_caqtl.
-        if scaling_version == 'a_p_robust_sd':
-            scaling_factor = a_p*robust_sd_p
-        elif scaling_version == 'robust_sd':
-            scaling_factor = robust_sd_p
-        elif scaling_version == 'none':
-            scaling_factor = 1.0
-        else:
-            print("Invalid scaling version: %s" % scaling_version)
-            sys.exit(1)
-        if peak_id in mapping:
-            print("Duplicate peak_id found in peak re-scaling file: %s" % peak_id)
-            sys.exit(1)
-        mapping[peak_id] = scaling_factor
-        peak_to_a_p[peak_id] = a_p
-        scaling_factors.append(scaling_factor)
-    scaling_factors = np.array(scaling_factors)
-    return mapping
-
-
-def dentist_s(z, R, tested, min_r2, dentist_T_threshold):
-    # DENTIST-S outliers against the lead variant among `tested` variants
-    # Returns (lead index, n tested partners, n outliers, max T)
-    if np.sum(tested) == 0:
-        return -1, 0, 0, 0.0
-    lead = int(np.argmax(np.where(tested, np.abs(z), -np.inf)))
-    r = np.clip(R[:, lead], -1.0, 1.0)
-    partners = tested & (r**2 >= min_r2)
-    partners[lead] = False
-    if np.sum(partners) == 0:
-        return lead, 0, 0, 0.0
-    T = (z[partners] - r[partners] * z[lead])**2 / np.maximum(1.0 - r[partners]**2, 0.01)
-    return lead, int(np.sum(partners)), int(np.sum(T > dentist_T_threshold)), float(np.max(T))
-
-
-def screen_ld_consistency(fm_input_summary_file, screened_summary_file, diagnostics_file, min_r2, dentist_p_threshold, max_outliers, drop_failed_eqtl_genes, run_kriging, kriging_threshold):
-    # LD-consistency screen of the prepared fine-mapping inputs (ported from fine_mapping_old/screen_ld_consistency.py)
-    # For each gene and each trait (the eQTL and every linked peak's caQTL):
-    #   DENTIST-S / SLALOM (Chen et al. 2021; Kanai et al. 2022): for every variant j with r^2 >= min_r2 to the lead variant l,
-    #     T_j = (z_j - r_jl z_l)^2 / (1 - r_jl^2) ~ chi2_1 if the summary statistics and the LD panel agree; an outlier is p < dentist_p_threshold.
-    #     Uses the LD before the s-regularization (undone from the recorded s), since shrinking r biases T at strong signals.
-    #   Kriging residual (optional, Zou et al. 2022): t_j = (Omega z)_j / sqrt(Omega_jj) with Omega = R^-1. Reported only.
-    # A trait fails if it has more than max_outliers outliers. Failing peaks are dropped from the gene (arrays rewritten with an
-    # _ld_screened suffix next to the originals); genes with a failing eQTL are dropped only if drop_failed_eqtl_genes. Imputed caQTL cells are not tested.
-    # Output: the screened summary (same columns as the input plus Kept_Peak_Indices) and a per-gene, per-trait diagnostics table.
-    dentist_T_threshold = chi2.isf(dentist_p_threshold, 1)
-    f = open(fm_input_summary_file)
-    t_sum = open(screened_summary_file, 'w')
-    t_diag = open(diagnostics_file, 'w')
-    t_diag.write('gene_id\ttrait\tlead_variant\tlead_z\tn_partners_tested\tn_dentist_outliers\tmax_dentist_T\tkriging_max_abs_t\tkriging_n_above_threshold\tfail\taction\n')
-    head_count = 0
-    n_genes = 0
-    n_genes_written = 0
-    n_genes_eqtl_fail = 0
-    n_peaks = 0
-    n_peaks_fail = 0
-    for line in f:
-        data = line.rstrip().split('\t')
-        if head_count == 0:
-            head_count += 1
-            header = data
-            t_sum.write('\t'.join(header + ['Kept_Peak_Indices']) + '\n')
-            continue
-        n_genes += 1
-        gene_id = data[0]
-        variant_ids = np.loadtxt(data[1], dtype=str, ndmin=1)
-        R_reg = np.load(data[2]).astype(float)
-        p = R_reg.shape[0]
-        zE = np.load(data[3]) / np.load(data[4])
-        bA = np.atleast_2d(np.load(data[5]))
-        sA = np.atleast_2d(np.load(data[6]))
-        K = bA.shape[0]
-        zA = bA / sA if K > 0 else np.zeros((0, p))
-        imputed = np.atleast_2d(np.load(data[9])).astype(bool) if K > 0 else np.zeros((K, p), dtype=bool)
-        ld_s = float(data[12])
-        # LD before regularization (R_reg = (1 - s) R + s I); the PSD projection is kept
-        R = (R_reg - ld_s * np.eye(p)) / (1.0 - ld_s) if ld_s > 0.0 else R_reg
-        np.fill_diagonal(R, 1.0)
-
-        # Kriging residuals against all other variants (uses the regularized LD the models use)
-        kr_max = np.full(K + 1, np.nan)
-        kr_n = np.full(K + 1, -1)
-        if run_kriging:
-            Omega = np.linalg.inv(R_reg)
-            Z = np.column_stack([zE[:, None], zA.T]) if K > 0 else zE[:, None]
-            tk = np.dot(Omega, Z) / np.sqrt(np.diag(Omega))[:, None]
-            for c in range(K + 1):
-                typed = np.ones(p, dtype=bool) if c == 0 else ~imputed[c - 1]
-                vals = np.abs(tk[typed, c])
-                kr_max[c] = np.max(vals) if len(vals) > 0 else np.nan
-                kr_n[c] = int(np.sum(vals > kriging_threshold))
-            del Omega
-
-        # DENTIST-S per trait
-        lead, n_part, n_out, maxT = dentist_s(zE, R, np.ones(p, dtype=bool), min_r2, dentist_T_threshold)
-        eqtl_fail = n_out > max_outliers
-        n_genes_eqtl_fail += int(eqtl_fail)
-        eqtl_action = 'gene dropped' if (eqtl_fail and drop_failed_eqtl_genes) else ('flagged' if eqtl_fail else 'kept')
-        t_diag.write('\t'.join(map(str, [gene_id, 'eQTL', variant_ids[lead] if lead >= 0 else 'NA', zE[lead] if lead >= 0 else 'NA', n_part, n_out, maxT, kr_max[0], kr_n[0], eqtl_fail, eqtl_action])) + '\n')
-        keep_peaks = np.ones(K, dtype=bool)
-        for k in range(K):
-            n_peaks += 1
-            lead, n_part, n_out, maxT = dentist_s(zA[k], R, ~imputed[k], min_r2, dentist_T_threshold)
-            peak_fail = n_out > max_outliers
-            n_peaks_fail += int(peak_fail)
-            if peak_fail:
-                keep_peaks[k] = False
-            t_diag.write('\t'.join(map(str, [gene_id, 'caQTL_peak' + str(k), variant_ids[lead] if lead >= 0 else 'NA', zA[k, lead] if lead >= 0 else 'NA', n_part, n_out, maxT, kr_max[k + 1], kr_n[k + 1], peak_fail, 'peak dropped' if peak_fail else 'kept'])) + '\n')
-        t_diag.flush()
-
-        if eqtl_fail and drop_failed_eqtl_genes:
-            continue
-        row = list(data)
-        if np.sum(keep_peaks) < K:
-            # Rewrite the per-peak arrays without the failing peaks (files with an _ld_screened suffix next to the originals)
-            for col in [5, 6, 7, 8, 9, 10]:
-                arr = np.load(data[col])
-                arr = np.atleast_2d(arr)[keep_peaks] if col in [5, 6, 9, 10] else arr[keep_peaks]
-                new_file = os.path.splitext(data[col])[0] + '_ld_screened.npy'
-                np.save(new_file, arr)
-                row[col] = new_file
-        row.append(','.join(map(str, np.where(keep_peaks)[0])) if K > 0 else '')
-        t_sum.write('\t'.join(row) + '\n')
-        n_genes_written += 1
-        if n_genes % 500 == 0:
-            print('LD screen gene ' + str(n_genes), flush=True)
-    f.close()
-    t_sum.close()
-    t_diag.close()
-    print(str(n_genes) + ' genes screened: ' + str(n_genes_eqtl_fail) + ' with an LD-inconsistent eQTL (' + ('dropped' if drop_failed_eqtl_genes else 'flagged, kept') + '); ' + str(n_peaks_fail) + ' of ' + str(n_peaks) + ' peaks with an LD-inconsistent caQTL (dropped); ' + str(n_genes_written) + ' genes written to ' + screened_summary_file, flush=True)
-    return
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--eqtl_file', type=str)
@@ -840,18 +662,11 @@ parser.add_argument('--cell_type', type=str)
 parser.add_argument('--gene_annotation_file', type=str)
 parser.add_argument('--sum_stats_fm_input_dir', type=str)
 parser.add_argument('--LD_fm_input_dir', type=str)
-parser.add_argument('--caqtl_rescaling_file', type=str)
 parser.add_argument('--distance_window', type=int, default=50000)  # Cis window (bp) around gene TSS
 parser.add_argument('--min_peak_variant_coverage', type=float, default=0.8)  # Min fraction of a gene's cis variants a linked peak must have caqtl sumstats for
 parser.add_argument('--ldstore_binary', type=str, default='/lab-share/CHIP-Strober-e2/Public/finngen/ld/ldstore_v1.1_x86_64/ldstore')  # Path to LDstore v1.1 executable (reads finngen bcor files)
 parser.add_argument('--ld_impute_ridge', type=float, default=0.1)  # Ridge added to LD of typed variants when imputing missing caqtl sumstats
 parser.add_argument('--ld_regularization_floor', type=float, default=0.05)  # Minimum LD-mismatch s: LD <- (1-s) LD + s I
-parser.add_argument('--ld_screen_min_r2', type=float, default=0.6)  # LD screen: variants tested against the lead have r^2 to the lead at least this
-parser.add_argument('--ld_screen_dentist_p_threshold', type=float, default=1e-2)  # LD screen: DENTIST-S outlier p-value threshold
-parser.add_argument('--ld_screen_max_outliers', type=int, default=0)  # LD screen: a trait fails if it has more outliers than this
-parser.add_argument('--ld_screen_keep_failed_eqtl_genes', action='store_true', default=False)  # LD screen: flag (rather than drop) genes with an LD-inconsistent eQTL
-parser.add_argument('--ld_screen_no_kriging', action='store_true', default=False)  # LD screen: skip the (p x p inverse) kriging residual diagnostics
-parser.add_argument('--ld_screen_kriging_threshold', type=float, default=4.0)  # LD screen: |t| above this is counted in the diagnostics
 args = parser.parse_args()
 
 eqtl_file = args.eqtl_file
@@ -867,13 +682,6 @@ min_peak_variant_coverage = args.min_peak_variant_coverage
 ldstore_binary = args.ldstore_binary
 ld_impute_ridge = args.ld_impute_ridge
 ld_regularization_floor = args.ld_regularization_floor
-ca_qtl_rescaling_file = args.caqtl_rescaling_file
-ld_screen_min_r2 = args.ld_screen_min_r2
-ld_screen_dentist_p_threshold = args.ld_screen_dentist_p_threshold
-ld_screen_max_outliers = args.ld_screen_max_outliers
-ld_screen_drop_failed_eqtl_genes = not args.ld_screen_keep_failed_eqtl_genes
-ld_screen_run_kriging = not args.ld_screen_no_kriging
-ld_screen_kriging_threshold = args.ld_screen_kriging_threshold
 
 
 
@@ -891,11 +699,8 @@ generate_eqtl_sumstats(eqtl_file, ens_id_to_chrom_num_and_tss, sum_stats_fm_inpu
 ##################################
 # Second generate caqtl and peak-gene link summary stats (for caqtl-mediated fine-mapping)
 ##################################
-scaling_version='a_p_robust_sd'
-peak_to_scaling_factor = create_mapping_from_peak_to_scaling_factor(ca_qtl_rescaling_file, scaling_version)
-
 caqtl_mediated_summary_file = sum_stats_fm_input_dir + cell_type + '_caqtl_mediated_sumstats_summary.txt'
-generate_caqtl_and_peak_gene_link_sumstats(eqtl_summary_file, caqtl_file, peak_gene_links_file, sum_stats_fm_input_dir, cell_type, min_peak_variant_coverage, caqtl_mediated_summary_file, peak_to_scaling_factor)
+generate_caqtl_and_peak_gene_link_sumstats(eqtl_summary_file, caqtl_file, peak_gene_links_file, sum_stats_fm_input_dir, cell_type, min_peak_variant_coverage, caqtl_mediated_summary_file)
 
 
 ##################################
@@ -905,9 +710,3 @@ fm_input_summary_file = sum_stats_fm_input_dir + cell_type + '_fine_mapping_inpu
 generate_fine_mapping_input(caqtl_mediated_summary_file, fingen_ld_dir, sum_stats_fm_input_dir, LD_fm_input_dir, cell_type, ldstore_binary, ld_impute_ridge, ld_regularization_floor, fm_input_summary_file)
 
 
-##################################
-# Fourth screen the fine-mapping inputs for LD consistency (drop LD-inconsistent peaks / genes)
-##################################
-screened_fm_input_summary_file = sum_stats_fm_input_dir + cell_type + '_fine_mapping_input_summary_ld_screened.txt'
-ld_screen_diagnostics_file = sum_stats_fm_input_dir + cell_type + '_ld_consistency_screen.txt'
-screen_ld_consistency(fm_input_summary_file, screened_fm_input_summary_file, ld_screen_diagnostics_file, ld_screen_min_r2, ld_screen_dentist_p_threshold, ld_screen_max_outliers, ld_screen_drop_failed_eqtl_genes, ld_screen_run_kriging, ld_screen_kriging_threshold)
