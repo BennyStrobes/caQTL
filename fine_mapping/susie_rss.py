@@ -1,6 +1,21 @@
 import numpy as np
 
 
+def zscore_quadratic_form(R, Z):
+    # z'R^-1 z for each column of Z (p x m) or for a vector z (p), from one factorization of R.
+    # R should be positive definite (the LD preparation regularizes it); fall back to a least-squares solve otherwise.
+    Z = np.asarray(Z, dtype=float)
+    rhs = Z if Z.ndim == 2 else Z[:, None]
+    try:
+        sol = np.linalg.solve(R, rhs)
+    except np.linalg.LinAlgError:
+        sol = np.linalg.lstsq(R, rhs, rcond=None)[0]
+    quad = np.sum(rhs * sol, axis=0)
+    if np.any(~np.isfinite(quad)) or np.any(quad < 0.0):
+        raise ValueError("z'R^-1 z is non-finite or negative: the LD matrix is not positive definite")
+    return quad if Z.ndim == 2 else float(quad[0])
+
+
 class SUSIE_RSS(object):
     """
     Sum of Single Effects (SuSiE) fine-mapping from summary statistics.
@@ -17,11 +32,12 @@ class SUSIE_RSS(object):
     convergence declared when the ELBO increases by less than 1e-3.
     """
 
-    def __init__(self, L=10, prior_variance=0.2, estimate_prior_variance=True, estimate_residual_variance=True, tol=1e-3, max_iter=100, coverage=0.95, min_abs_corr=0.5):
+    def __init__(self, L=10, prior_variance=0.2, estimate_prior_variance=True, estimate_residual_variance=True, zscore_residual_variance=False, tol=1e-3, max_iter=100, coverage=0.95, min_abs_corr=0.5):
         self.L = L
         self.prior_variance = prior_variance                    # initial prior variance of each effect, as a fraction of var(y)
         self.estimate_prior_variance = estimate_prior_variance
         self.estimate_residual_variance = estimate_residual_variance
+        self.zscore_residual_variance = zscore_residual_variance   # z-score model (n None) with a residual variance: z ~ N(R b, sigma2 R), sigma2 estimated (y'y = z'R^-1 z, n = p)
         self.tol = tol
         self.max_iter = max_iter
         self.coverage = coverage                                # credible set coverage
@@ -42,7 +58,8 @@ class SUSIE_RSS(object):
         self.converged = None
         self.n_iter = None
 
-    def fit(self, beta_hat, beta_se, ld_mat, n, prior_weights=None):
+    def fit(self, beta_hat, beta_se, ld_mat, n, prior_weights=None, zscore_yty=None):
+        # zscore_yty: precomputed z'R^-1 z for the z-score residual variance model (otherwise computed here)
         beta_hat = np.asarray(beta_hat, dtype=float)
         beta_se = np.asarray(beta_se, dtype=float)
         ld_mat = np.asarray(ld_mat, dtype=float)
@@ -61,7 +78,17 @@ class SUSIE_RSS(object):
         self.ld_mat = ld_mat
 
         # Convert summary statistics to sufficient statistics
-        if n is None:
+        if n is None and self.zscore_residual_variance:
+            # z-score model with a residual variance, z_hat ~ N(R z, sigma2 R): X'X = R, X'y = z, y'y = z'R^-1 z and n = p make
+            # -n/2 log(2 pi sigma2) - RSS/(2 sigma2) the exact log density of z_hat (up to the constant -1/2 log det R),
+            # so sigma2 = E[RSS]/p is the maximum likelihood update. sigma2 > 1 means the z-scores are overdispersed
+            # relative to the LD null (polygenic background or LD mismatch).
+            self.XtX = ld_mat
+            self.Xty = beta_hat / beta_se
+            self.yty = zscore_quadratic_form(ld_mat, self.Xty) if zscore_yty is None else float(zscore_yty)
+            self.n = p
+            estimate_residual_variance = self.estimate_residual_variance
+        elif n is None:
             # z-score model z_hat ~ N(R z, R): equivalent to X'X = R, X'y = z with residual variance fixed at 1.
             # n and y'y are placeholders that only enter the ELBO as constants (they give var_y = 1).
             self.XtX = ld_mat
@@ -81,7 +108,7 @@ class SUSIE_RSS(object):
             if np.max(np.abs(yty_per_snp / self.yty - 1.0)) > 0.05:
                 print('warning: the y variance implied by (beta_hat, beta_se) differs across SNPs by more than 5%. Are these OLS summary statistics on standardized genotypes?')
         self.dXtX = np.diag(self.XtX).copy()
-        self.var_y = self.yty / (self.n - 1.0)
+        self.var_y = self.yty / max(self.n - 1.0, 1.0)
 
         # Prior probability that a single effect is on each SNP
         if prior_weights is None:
