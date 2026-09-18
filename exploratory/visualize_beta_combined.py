@@ -58,6 +58,8 @@ def load_pairs_with_prediction(beta_combined_file):
     chunks = []
     gene_chunks = []
     n_total = 0
+    n_with_pred_raw = 0
+    genes_with_pred_raw = set()
     for chunk in pd.read_csv(beta_combined_file, sep='\t', usecols=cols, chunksize=5000000, na_values=['NA']):
         n_total += len(chunk)
         # Per gene within the chunk: number of tested pairs and the pair with the largest |z_eQTL|
@@ -71,6 +73,8 @@ def load_pairs_with_prediction(beta_combined_file):
             lead['n_tested'] = g.size()
             gene_chunks.append(lead)
         chunk = chunk.dropna(subset=['beta_eqtl_hat', 'beta_eqtl_se', 'beta_combined', 'se_combined'])
+        n_with_pred_raw += len(chunk)
+        genes_with_pred_raw.update(chunk['gene_id'].unique())
         chunks.append(chunk)
         print("lines read: %d" % n_total, flush=True)
     gene_cols = ['max_abs_z_eqtl_all', 'lead_beta_eqtl_all', 'n_tested_all']
@@ -82,7 +86,7 @@ def load_pairs_with_prediction(beta_combined_file):
     else:
         gene_all = pd.DataFrame(columns=gene_cols, index=pd.Index([], name='gene_id'))
     if len(chunks) == 0:
-        return pd.DataFrame(columns=cols + ['z_eqtl', 'z_pred']), gene_all
+        return pd.DataFrame(columns=cols + ['z_eqtl', 'z_pred']), gene_all, {}
     df = pd.concat(chunks, ignore_index=True)
     # Drop pairs with a zero standard error, which would give infinite z-scores, and pairs with a non-finite SE or
     # unbiased variance (an infinite link SE gives se_combined = inf and var_combined_unbiased = inf - inf = NaN)
@@ -99,7 +103,11 @@ def load_pairs_with_prediction(beta_combined_file):
     df['z_eqtl'] = df['beta_eqtl_hat'] / df['beta_eqtl_se']
     df['z_pred'] = df['beta_combined'] / df['se_combined']
     print("variant-gene pairs: %d; with prediction: %d; genes tested: %d" % (n_total, len(df), len(gene_all)), flush=True)
-    return df, gene_all
+    # Funnel counts (pairs, genes) at each stage of the pipeline that is recoverable from the output file
+    funnel = {'tested': (n_total, len(gene_all)),
+              'with_prediction': (n_with_pred_raw, len(genes_with_pred_raw)),
+              'finite_se': (len(df), df['gene_id'].nunique())}
+    return df, gene_all, funnel
 
 
 ########################
@@ -1201,6 +1209,295 @@ def fig_effect_size_by_loeuf_decile(genes, calls, loeuf, alpha, cell_type, outpu
 ########################
 # Main
 ########################
+def fig_null_qq(z_pred, z_eqtl, cell_type, output_file, null_z=1, n_points=2000):
+    # QQ plot of z_pred among pairs with no observed eQTL signal (|z_eQTL| < null_z). If the prediction carried no
+    # information beyond its stated SE where there is no eQTL, z_pred would be N(0,1); inflation means the SE is too
+    # small or the link model leaks signal. Shown for all such pairs and for the extreme tail (|z_eQTL| < 0.5)
+    import scipy.stats
+    fig, axes = plt.subplots(1, 2, figsize=(8.6, 4.1))
+    rows = []
+    for ax, t in zip(axes, [null_z, null_z / 2]):
+        z = np.sort(z_pred[np.abs(z_eqtl) < t])
+        n = len(z)
+        if n < 10:
+            ax.text(0.5, 0.5, 'n = %d' % n, transform=ax.transAxes, ha='center')
+            continue
+        probs = (np.arange(1, n + 1) - 0.5) / n
+        expected = scipy.stats.norm.ppf(probs)
+        # Thin the middle of the distribution for plotting, keep the tails intact
+        keep = np.unique(np.concatenate([np.linspace(0, n - 1, n_points).astype(int), np.arange(min(200, n)),
+                                         np.arange(max(0, n - 200), n)]))
+        lam = np.median(z ** 2) / scipy.stats.chi2.ppf(0.5, 1)
+        sd = np.std(z)
+        lim = max(abs(expected[0]), abs(expected[-1]), abs(z[0]), abs(z[-1])) * 1.05
+        ax.plot([-lim, lim], [-lim, lim], color=GRID_GRAY, linewidth=1, zorder=1)
+        ax.plot(expected[keep], z[keep], 'o', color=SERIES[0], markersize=2.5, markeredgewidth=0, zorder=3)
+        ax.text(0.03, 0.97, 'n = %s pairs\nλ_GC = %.3f\nSD(z_pred) = %.3f' % (format(n, ','), lam, sd),
+                transform=ax.transAxes, fontsize=8, color=INK_SECONDARY, va='top')
+        ax.set_title('Pairs with |z_eQTL| < %g' % t, fontsize=9, color=INK)
+        ax.set_xlabel('Expected N(0,1) quantile', color=INK, fontsize=9)
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_aspect('equal')
+        style_axes(ax)
+        rows.append((t, n, lam, sd, np.mean(np.abs(z) > 2), np.mean(np.abs(z) > 4)))
+    axes[0].set_ylabel('Observed z_pred quantile', color=INK, fontsize=9)
+    fig.suptitle('%s cells: z_pred where there is no observed eQTL signal' % cell_type, fontsize=10, color=INK)
+    fig.tight_layout()
+    fig.savefig(output_file)
+    plt.close(fig)
+
+    summary = pd.DataFrame(rows, columns=['max_abs_z_eqtl', 'n', 'lambda_gc', 'sd_z_pred', 'frac_abs_z_pred_gt2', 'frac_abs_z_pred_gt4'])
+    summary.to_csv(summary_path(output_file), sep='\t', index=False)
+    return summary
+
+
+def fig_coverage_funnel(stages, cell_type, output_file):
+    # Horizontal bar chart of how many variant-gene pairs (left) and genes (right) survive each stage of the pipeline.
+    # stages: list of (label, n_pairs, n_genes), in order. Each bar is annotated with the count and the fraction of stage 1
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.8))
+    rows = []
+    labels = [s[0] for s in stages]
+    y = np.arange(len(stages))[::-1]
+    for ax, j, name in [(axes[0], 1, 'Variant-gene pairs'), (axes[1], 2, 'Genes')]:
+        counts = np.array([s[j] for s in stages], dtype=float)
+        ax.barh(y, counts, color=SERIES[0], height=0.65, zorder=3)
+        for yi, c in zip(y, counts):
+            ax.text(c + counts[0] * 0.01, yi, '%s (%.1f%%)' % (format(int(c), ','), 100 * c / counts[0] if counts[0] > 0 else 0),
+                    fontsize=8, color=INK_SECONDARY, va='center')
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, fontsize=8, color=INK)
+        ax.set_xlim(0, counts[0] * 1.35)
+        ax.set_title(name, fontsize=9, color=INK)
+        ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: compact(v)))
+        ax.grid(True, axis='x', color=GRID_GRAY, linewidth=0.5, alpha=0.6, zorder=0)
+        style_axes(ax)
+    axes[1].set_yticklabels([])
+    fig.suptitle('%s cells: prediction coverage' % cell_type, fontsize=10, color=INK)
+    fig.tight_layout()
+    fig.savefig(output_file)
+    plt.close(fig)
+
+    summary = pd.DataFrame(stages, columns=['stage', 'n_pairs', 'n_genes'])
+    summary.to_csv(summary_path(output_file), sep='\t', index=False)
+    return summary
+
+
+def fig_variance_diagnostics(df, cell_type, output_file):
+    # Sanity check on the delta-method variance. Left: se_combined^2 (conservative, includes the cross term) vs the
+    # unbiased variance (subtracts it), on log axes; points below zero on the unbiased side are shown on the log axis
+    # as |var| with a separate colour. Middle: fraction of pairs with a negative unbiased variance, by n_peaks.
+    # Right: ratio of unbiased to conservative variance, by n_peaks (median with 5-95% band)
+    var_c = (df['se_combined'] ** 2).to_numpy()
+    var_u = df['var_combined_unbiased'].to_numpy()
+    n_peaks = df['n_peaks'].to_numpy()
+    neg = var_u < 0
+    fig, axes = plt.subplots(1, 3, figsize=(12, 3.9))
+
+    ax = axes[0]
+    rng = np.random.default_rng(0)
+    idx = rng.choice(len(df), size=min(len(df), 200000), replace=False)
+    ax.plot(var_c[idx][~neg[idx]], var_u[idx][~neg[idx]], 'o', color=SERIES[0], markersize=1.5, markeredgewidth=0, alpha=0.3,
+            label='unbiased ≥ 0', zorder=3)
+    if neg[idx].any():
+        ax.plot(var_c[idx][neg[idx]], -var_u[idx][neg[idx]], 'o', color=SERIES[1], markersize=1.5, markeredgewidth=0, alpha=0.3,
+                label='unbiased < 0 (|value| shown)', zorder=3)
+    lim = (np.nanmin(var_c[var_c > 0]), np.nanmax(var_c))
+    ax.plot(lim, lim, color=GRID_GRAY, linewidth=1, zorder=1)
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlabel('se_combined² (conservative)', color=INK, fontsize=9)
+    ax.set_ylabel('var_combined_unbiased', color=INK, fontsize=9)
+    ax.legend(fontsize=7, frameon=False, loc='upper left', markerscale=4)
+    ax.set_title('Negative unbiased variance: %.2f%% of pairs' % (100 * neg.mean()), fontsize=9, color=INK)
+    style_axes(ax)
+
+    peak_group = np.digitize(n_peaks, N_PEAK_EDGES[1:-1])
+    peak_labels = range_labels(N_PEAK_EDGES, integer=True)
+    rows = []
+    ax = axes[1]
+    fracs, cis, ns = [], [], []
+    for g in range(len(peak_labels)):
+        m = peak_group == g
+        k, n = int(neg[m].sum()), int(m.sum())
+        _, lo, hi = wilson_ci(k, n)
+        fracs.append(k / n if n > 0 else np.nan)
+        cis.append((lo, hi))
+        ns.append(n)
+    fracs = np.array(fracs)
+    cis = np.array(cis)
+    x = np.arange(len(peak_labels))
+    ax.errorbar(x, fracs, yerr=[fracs - cis[:, 0], cis[:, 1] - fracs], fmt='o-', color=SERIES[0], capsize=2, markersize=5, zorder=3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(['%s\nn=%s' % (l, compact(n)) for l, n in zip(peak_labels, ns)], fontsize=8)
+    ax.set_xlabel('Number of peaks contributing to the prediction', color=INK, fontsize=9)
+    ax.set_ylabel('Fraction with negative unbiased variance', color=INK, fontsize=9)
+    ax.set_ylim(bottom=0)
+    ax.grid(True, axis='y', color=GRID_GRAY, linewidth=0.5, alpha=0.6, zorder=0)
+    style_axes(ax)
+
+    ax = axes[2]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ratio = var_u / var_c
+    med, q05, q95 = [], [], []
+    for g in range(len(peak_labels)):
+        r = ratio[(peak_group == g) & np.isfinite(ratio)]
+        if len(r) > 0:
+            med.append(np.median(r)); q05.append(np.percentile(r, 5)); q95.append(np.percentile(r, 95))
+        else:
+            med.append(np.nan); q05.append(np.nan); q95.append(np.nan)
+        rows.append((peak_labels[g], ns[g], fracs[g], cis[g, 0], cis[g, 1], med[-1], q05[-1], q95[-1]))
+    ax.fill_between(x, q05, q95, color=SERIES[0], alpha=0.15, linewidth=0, zorder=2)
+    ax.plot(x, med, 'o-', color=SERIES[0], markersize=5, zorder=3)
+    ax.axhline(1, color=GRID_GRAY, linewidth=1, zorder=1)
+    ax.axhline(0, color=GRID_GRAY, linewidth=1, zorder=1)
+    ax.set_xticks(x)
+    ax.set_xticklabels(peak_labels, fontsize=8)
+    ax.set_xlabel('Number of peaks contributing to the prediction', color=INK, fontsize=9)
+    ax.set_ylabel('var_unbiased / se_combined²  (median, 5–95%)', color=INK, fontsize=9)
+    ax.grid(True, axis='y', color=GRID_GRAY, linewidth=0.5, alpha=0.6, zorder=0)
+    style_axes(ax)
+
+    fig.suptitle('%s cells: delta-method variance diagnostics' % cell_type, fontsize=10, color=INK)
+    fig.tight_layout()
+    fig.savefig(output_file, dpi=200)
+    plt.close(fig)
+
+    summary = pd.DataFrame(rows, columns=['n_peaks', 'n', 'frac_negative', 'ci_lower', 'ci_upper', 'ratio_median', 'ratio_q05', 'ratio_q95'])
+    summary.to_csv(summary_path(output_file), sep='\t', index=False)
+    return summary
+
+
+def fig_shrinkage_check(df, cell_type, output_file, max_se_pred=0.1):
+    # Is the delta-method SE the right amount of noise? Under the measurement-error model x_hat = x + e with known
+    # var(e), and y = slope_true * x + noise, the regression of y on x_hat has slope
+    #     slope_true * reliability,   reliability = var(x) / (var(x) + var(e))
+    # var(x) and slope_true come from the global moment estimate (figure 19). Because var(e) differs across pairs, the
+    # expected slope differs across |z_pred| bins: it uses the mean var(e) within the bin. The empirical within-bin OLS
+    # slope of beta_eQTL on beta_pred is compared with that expectation. Agreement means the stated SE is the right
+    # amount of shrinkage to apply when using beta_pred as a prior; an empirical slope below expectation means the SE
+    # is too small (under-shrinkage), above means too large
+    keep = (df['se_combined'] <= max_se_pred).to_numpy()
+    x = df.loc[keep, 'beta_combined'].to_numpy()
+    y = df.loc[keep, 'beta_eqtl_hat'].to_numpy()
+    vx = df.loc[keep, 'var_combined_unbiased'].to_numpy()
+    vy = df.loc[keep, 'beta_eqtl_se'].to_numpy() ** 2
+    z = np.abs(df.loc[keep, 'z_pred'].to_numpy())
+    m = moment_correlation(x, y, vx, vy)
+    var_true = np.var(x) - np.mean(vx)
+    group = np.digitize(z, Z_EDGES[1:-1])
+    labels = range_labels(Z_EDGES)
+    rows = []
+    for g in range(len(labels)):
+        k = group == g
+        if k.sum() < 100:
+            rows.append((labels[g], int(k.sum()), np.nan, np.nan, np.nan, np.nan))
+            continue
+        slope, se = ols_slope(x[k], y[k])
+        # Expected within-bin OLS slope: regress the model's conditional mean, slope_true * r_i * x_hat_i with
+        # per-pair reliability r_i = var(x) / (var(x) + var(e_i)), on x_hat within the bin. Pairs with a large SE have
+        # a large |x_hat| at a given |z|, so they dominate the within-bin OLS while having the lowest reliability;
+        # a single mean reliability per bin would overstate the expected slope
+        if var_true > 0:
+            r_i = var_true / (var_true + vx[k])
+            expected, _ = ols_slope(x[k], m['slope_true'] * r_i * x[k])
+            rel = np.mean(r_i)
+        else:
+            expected, rel = np.nan, np.nan
+        rows.append((labels[g], int(k.sum()), slope, se, rel, expected))
+    summary = pd.DataFrame(rows, columns=['abs_z_pred', 'n', 'slope_empirical', 'slope_se', 'mean_reliability', 'slope_expected'])
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.1))
+    xs = np.arange(len(labels))
+    ax.axhline(m['slope_naive'], color=GRID_GRAY, linewidth=1, zorder=1)
+    ax.text(len(labels) - 0.6, m['slope_naive'], 'global naive slope', fontsize=7, color=INK_SECONDARY, va='bottom', ha='right')
+    ax.axhline(m['slope_true'], color=GRID_GRAY, linewidth=1, linestyle='--', zorder=1)
+    ax.text(len(labels) - 0.6, m['slope_true'], 'global noise-corrected slope', fontsize=7, color=INK_SECONDARY, va='bottom', ha='right')
+    ax.plot(xs, summary['slope_expected'], 's-', color=SERIES[1], markersize=5, markeredgecolor='white',
+            label='Expected: slope_true × per-pair reliability', zorder=3)
+    ax.errorbar(xs, summary['slope_empirical'], yerr=1.96 * summary['slope_se'], fmt='o', color=SERIES[0], ecolor=SERIES[0],
+                elinewidth=1, capsize=2, markersize=6, markeredgecolor='white', label='Empirical within-bin OLS slope', zorder=4)
+    ax.set_xticks(xs)
+    ax.set_xticklabels(['%s\nn=%s' % (l, compact(n)) for l, n in zip(labels, summary['n'])], fontsize=8)
+    ax.set_xlabel('|z_pred|', color=INK, fontsize=9)
+    ax.set_ylabel('Slope of β_eQTL on β_pred', color=INK, fontsize=9)
+    ax.legend(frameon=False, fontsize=8, labelcolor=INK_SECONDARY, loc='upper left')
+    ax.grid(True, axis='y', color=GRID_GRAY, linewidth=0.5, alpha=0.6, zorder=0)
+    style_axes(ax)
+    ax.set_title('%s cells: shrinkage calibration (se_combined ≤ %g; var(x_true) = %.2e, slope_true = %.2f ± %.2f)'
+                 % (cell_type, max_se_pred, var_true, m['slope_true'], m['slope_true_se']), fontsize=8, color=INK)
+    fig.tight_layout()
+    fig.savefig(output_file)
+    plt.close(fig)
+    summary.to_csv(summary_path(output_file), sep='\t', index=False)
+    return summary
+
+
+def fig_heteroskedasticity(df, cell_type, output_file, n_bins=20, max_se_pred=0.1):
+    # Residual variance of beta_eQTL around the global calibration line (naive OLS of beta_eQTL on beta_pred), by
+    # equal-count bin of |beta_pred|, against the mean eQTL sampling variance in the bin. The excess (residual minus
+    # sampling) is the variance of the true eQTL effect given the prediction. Under the model it is
+    #     slope_true² · var(x | x_hat) + var(y_true | x)   with   var(x | x_hat) = var(x) · (1 - reliability_bin)
+    # which is roughly flat in |beta_pred| apart from the reliability term. Excess that grows with |beta_pred| beyond
+    # that means the link / caQTL error scales with the effect size in a way the delta-method SE does not capture
+    keep = (df['se_combined'] <= max_se_pred).to_numpy()
+    x = df.loc[keep, 'beta_combined'].to_numpy()
+    y = df.loc[keep, 'beta_eqtl_hat'].to_numpy()
+    vx = df.loc[keep, 'var_combined_unbiased'].to_numpy()
+    vy = df.loc[keep, 'beta_eqtl_se'].to_numpy() ** 2
+    slope, _ = ols_slope(x, y)
+    intercept = np.mean(y) - slope * np.mean(x)
+    resid2 = (y - intercept - slope * x) ** 2
+    m = moment_correlation(x, y, vx, vy)
+    var_true = np.var(x) - np.mean(vx)
+    # Variance of true y around the true-effect line: var(y_true) - slope_true² var(x_true)
+    var_y_true = np.var(y) - np.mean(vy)
+    resid_true = var_y_true - m['slope_true'] ** 2 * var_true if np.isfinite(m['slope_true']) else np.nan
+    bins = equal_count_bins(np.abs(x), n_bins)
+    rows = []
+    for b in range(n_bins):
+        k = bins == b
+        n = int(k.sum())
+        rv, rv_se = np.mean(resid2[k]), np.std(resid2[k]) / np.sqrt(n)
+        sv = np.mean(vy[k])
+        one_minus_r = np.mean(vx[k] / (var_true + vx[k])) if var_true > 0 else np.nan
+        expected = m['slope_true'] ** 2 * var_true * one_minus_r + resid_true if np.isfinite(one_minus_r) else np.nan
+        rows.append((b + 1, n, np.mean(np.abs(x[k])), rv, rv_se, sv, rv - sv, expected))
+    summary = pd.DataFrame(rows, columns=['bin', 'n', 'mean_abs_beta_pred', 'resid_var', 'resid_var_se', 'mean_se_eqtl_sq',
+                                          'excess_var', 'expected_excess_var'])
+
+    fig, axes = plt.subplots(1, 2, figsize=(9.6, 4))
+    xs = summary['mean_abs_beta_pred']
+    ax = axes[0]
+    ax.errorbar(xs, summary['resid_var'], yerr=1.96 * summary['resid_var_se'], fmt='o-', color=SERIES[0], ecolor=SERIES[0],
+                elinewidth=0.8, capsize=2, markersize=5, markeredgecolor='white', label='Residual variance around calibration line', zorder=4)
+    ax.plot(xs, summary['mean_se_eqtl_sq'], 's-', color=SERIES[1], markersize=4, markeredgecolor='white', label='Mean SE_eQTL²', zorder=3)
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_ylabel('Variance of β_eQTL', color=INK, fontsize=9)
+    ax.legend(frameon=False, fontsize=8, labelcolor=INK_SECONDARY, loc='upper left')
+    ax = axes[1]
+    ax.axhline(0, color=GRID_GRAY, linewidth=1, zorder=1)
+    ax.errorbar(xs, summary['excess_var'], yerr=1.96 * summary['resid_var_se'], fmt='o-', color=SERIES[0], ecolor=SERIES[0],
+                elinewidth=0.8, capsize=2, markersize=5, markeredgecolor='white', label='Excess: residual − sampling', zorder=4)
+    ax.plot(xs, summary['expected_excess_var'], 's-', color=SERIES[1], markersize=4, markeredgecolor='white',
+            label='Expected under model', zorder=3)
+    ax.set_xscale('log')
+    ax.set_ylabel('Excess variance of β_eQTL given β_pred', color=INK, fontsize=9)
+    ax.legend(frameon=False, fontsize=8, labelcolor=INK_SECONDARY, loc='upper left')
+    for ax in axes:
+        ax.set_xlabel('Mean |β_pred| in bin (%d equal-count bins)' % n_bins, color=INK, fontsize=9)
+        ax.grid(True, color=GRID_GRAY, linewidth=0.5, alpha=0.6, zorder=0)
+        style_axes(ax)
+    fig.suptitle('%s cells: heteroskedasticity of the observed eQTL effect (calibration slope = %.3f; se_combined ≤ %g)'
+                 % (cell_type, slope, max_se_pred), fontsize=9, color=INK)
+    fig.tight_layout()
+    fig.savefig(output_file)
+    plt.close(fig)
+    summary.to_csv(summary_path(output_file), sep='\t', index=False)
+    return summary
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--beta_combined_file', type=str, required=True)
@@ -1216,7 +1513,7 @@ def parse_args():
 if __name__ == '__main__':
     args = parse_args()
 
-    df, gene_all = load_pairs_with_prediction(args.beta_combined_file)
+    df, gene_all, funnel = load_pairs_with_prediction(args.beta_combined_file)
     gene_max_abs_z_eqtl_all = gene_all['max_abs_z_eqtl_all']
     if len(df) < args.n_bins:
         print("Not enough variant-gene pairs with a prediction to form %d bins: %d" % (args.n_bins, len(df)))
@@ -1383,6 +1680,32 @@ if __name__ == '__main__':
     loeuf = load_loeuf_deciles(args.loeuf_file, gene_all.index) if args.loeuf_file is not None else None
     summary = fig_moment_correlation(df, args.cell_type, '%s_moment_correlation.%s' % (args.output_prefix, fmt), loeuf=loeuf)
     print(summary[['n', 'r_naive', 'r_true', 'r_true_se', 'slope_true', 'slope_true_se', 'reliability_x', 'reliability_y']].to_string(), flush=True)
+
+    # 25. QQ plot of z_pred among pairs with no observed eQTL signal: should be N(0,1) if the SE is right and nothing leaks
+    summary = fig_null_qq(z_pred, z_eqtl, args.cell_type, '%s_null_qq.%s' % (args.output_prefix, fmt))
+    print(summary.to_string(index=False), flush=True)
+
+    # 26. Prediction coverage funnel: pairs and genes surviving each stage
+    n_genes_conf = lambda m: df.loc[m, 'gene_id'].nunique()
+    stages = [('Tested by eQTL study', funnel['tested'][0], funnel['tested'][1]),
+              ('Has a prediction (≥ 1 linked peak with caQTL)', funnel['with_prediction'][0], funnel['with_prediction'][1]),
+              ('Finite SE and variance', funnel['finite_se'][0], funnel['finite_se'][1]),
+              ('|z_pred| > 2', int((np.abs(z_pred) > 2).sum()), n_genes_conf(np.abs(z_pred) > 2)),
+              ('|z_pred| > 4', int((np.abs(z_pred) > 4).sum()), n_genes_conf(np.abs(z_pred) > 4))]
+    summary = fig_coverage_funnel(stages, args.cell_type, '%s_coverage_funnel.%s' % (args.output_prefix, fmt))
+    print(summary.to_string(index=False), flush=True)
+
+    # 27. Delta-method variance diagnostics: conservative vs unbiased variance, negative-variance rate by n_peaks
+    summary = fig_variance_diagnostics(df, args.cell_type, '%s_variance_diagnostics.png' % args.output_prefix)
+    print(summary.to_string(index=False), flush=True)
+
+    # 28. Shrinkage calibration: within-|z_pred|-bin slope of beta_eQTL on beta_pred vs slope_true x bin reliability
+    summary = fig_shrinkage_check(df, args.cell_type, '%s_shrinkage_check.%s' % (args.output_prefix, fmt))
+    print(summary.to_string(index=False), flush=True)
+
+    # 29. Heteroskedasticity: residual variance around the calibration line vs eQTL sampling variance, by |beta_pred|
+    summary = fig_heteroskedasticity(df, args.cell_type, '%s_heteroskedasticity.%s' % (args.output_prefix, fmt))
+    print(summary.to_string(index=False), flush=True)
 
     # 20-24. Gene constraint (LOEUF decile) analyses; all use per-gene Bonferroni calls rather than a fixed |z| cutoff
     if args.loeuf_file is not None:

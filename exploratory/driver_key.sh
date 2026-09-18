@@ -42,10 +42,9 @@ cell_type="CD4_T"
 sbatch generate_beta_combined.sh ${cell_type} ${fingen_eqtl_dir} ${fingen_caqtl_dir} ${fingen_peak_gene_links_dir} ${pred_beta_combined_dir} $peak_re_scaling_dir
 fi
 
-if false; then
 cell_type="CD4_T"
     sh visualize_beta_combined.sh ${cell_type} ${pred_beta_combined_dir} ${visualization_dir} ${loeuf_file}
-fi
+
 
 
 # First create beta combined for each cell type
