@@ -196,7 +196,7 @@ class EQTL_ONLY_EXPRESSION_PREDICTION(object):
 
         # Loop through genes to initialize gene-specific variables
         for gene_id in self.gene_ids:
-            n_variants = len(np.loadtxt(self.gene_to_data[gene_id]['variant_ids_file'], dtype=str))
+            n_variants = len(np.loadtxt(self.gene_to_data[gene_id]['variant_ids_file'], dtype=str, ndmin=1))
             # Quick error check
             if n_variants != len(self.gene_to_data[gene_id]['eqtl_effects']):
                 print("Error: n_variants != len(eqtl_effects) for gene_id %s" % (gene_id))

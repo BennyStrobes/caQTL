@@ -5,9 +5,10 @@ import pdb
 import numpy as np
 from joint_eqtl_caqtl_expression_prediction import JOINT_EQTL_CAQTL_EXPRESSION_PREDICTION
 
-def load_in_input_data(sumstat_summary_file):
+def load_in_input_data(sumstat_summary_file, min_variants_per_gene=10):
     # Initialize data storage object
     gene_to_data = {}
+    n_genes_filtered = 0
     n_peaks_filtered = 0
     n_peaks_total = 0
 
@@ -36,6 +37,11 @@ def load_in_input_data(sumstat_summary_file):
         peak_se = np.load(peak_se_file)
         eqtl_effects = np.load(eqtl_effects_file)
         eqtl_se = np.load(eqtl_se_file)
+
+        # Filter out genes with too few variants
+        if len(eqtl_effects) < min_variants_per_gene:
+            n_genes_filtered += 1
+            continue
 
         # Load in peak ids if they exist (file sits next to the variant ids file; not listed in the summary file)
         peak_ids_file = variant_ids_file.split('_variant_ids.txt')[0] + '_peak_ids.txt'
@@ -74,6 +80,7 @@ def load_in_input_data(sumstat_summary_file):
         gene_to_data[gene_id]['peak_ids'] = peak_ids
 
     f.close()
+    print('Filtered out ' + str(n_genes_filtered) + ' genes with fewer than ' + str(min_variants_per_gene) + ' variants (' + str(len(gene_to_data)) + ' genes remain)')
     print('Filtered out ' + str(n_peaks_filtered) + ' of ' + str(n_peaks_total) + ' peak-gene pairs with invalid peak-gene effects')
     return gene_to_data
 

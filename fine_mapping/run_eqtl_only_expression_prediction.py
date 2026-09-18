@@ -5,9 +5,10 @@ import pdb
 import numpy as np
 from eqtl_only_expression_prediction import EQTL_ONLY_EXPRESSION_PREDICTION
 
-def load_in_input_data(sumstat_summary_file):
+def load_in_input_data(sumstat_summary_file, min_variants_per_gene=10):
     # Initialize data storage object
     gene_to_data = {}
+    n_genes_filtered = 0
 
     f = open(sumstat_summary_file, 'r')
     head_count = 0
@@ -27,6 +28,11 @@ def load_in_input_data(sumstat_summary_file):
         eqtl_effects = np.load(eqtl_effects_file)
         eqtl_se = np.load(eqtl_se_file)
 
+        # Filter out genes with too few variants
+        if len(eqtl_effects) < min_variants_per_gene:
+            n_genes_filtered += 1
+            continue
+
         if gene_id in gene_to_data:
             print("Error: gene_id %s already in gene_to_data" % (gene_id))
             sys.exit(1)
@@ -39,6 +45,7 @@ def load_in_input_data(sumstat_summary_file):
         gene_to_data[gene_id]['eqtl_se'] = eqtl_se
 
     f.close()
+    print('Filtered out ' + str(n_genes_filtered) + ' genes with fewer than ' + str(min_variants_per_gene) + ' variants (' + str(len(gene_to_data)) + ' genes remain)')
     return gene_to_data
 
 

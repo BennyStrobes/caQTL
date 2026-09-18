@@ -422,7 +422,7 @@ class JOINT_EQTL_CAQTL_EXPRESSION_PREDICTION(object):
         self.mediation_probs = {} # Variational posterior probability that peak mediates eQTL effects on the gene (held at 1 if mediation_indicator is False)
         # Loop through genes to initialize gene-specific variables
         for gene_id in self.gene_ids:
-            n_variants = len(np.loadtxt(self.gene_to_data[gene_id]['variant_ids_file'], dtype=str))
+            n_variants = len(np.loadtxt(self.gene_to_data[gene_id]['variant_ids_file'], dtype=str, ndmin=1))
             n_peaks = self.gene_to_data[gene_id]['caqtl_effects'].shape[0]
             # Quick error check
             if n_variants != len(self.gene_to_data[gene_id]['eqtl_effects']) or n_variants != (self.gene_to_data[gene_id]['caqtl_effects']).shape[1]:
