@@ -62,10 +62,9 @@ fi
 #####################
 # Run fine-mapping (standard eQTL-only SuSiE and caQTL-mediated) on the prepared input
 #####################
-
 if false; then
-cell_type="Mono"
-    fm_input_summary_file=${sum_stats_fm_input_dir}${cell_type}"_fine_mapping_input_summary_tmp.txt"
-    sh run_fine_mapping.sh ${fm_input_summary_file} ${cell_type} ${fine_mapping_results_dir}
+cell_type="CD4_T"
+    fm_input_summary_file=${sum_stats_fm_input_dir}${cell_type}"_fine_mapping_input_summary_ld_screened.txt"
+    sbatch run_fine_mapping.sh ${fm_input_summary_file} ${cell_type} ${fine_mapping_results_dir}
 fi
 
