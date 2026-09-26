@@ -32,6 +32,13 @@ gene_annotation_file="/lab-share/CHIP-Strober-e2/Public/gene_annotation_files/ge
 # Directory containing re-scaling information for peak data
 peak_re_scaling_dir="/lab-share/CHIP-Strober-e2/Public/finngen/public_multiome/rescaling_data_from_masa/"
 
+# Directory containing gtex genotype data
+gtex_genotype_data_dir="/lab-share/CHIP-Strober-e2/Public/ben/gdl_uncertainty_paper/gtex_eqtl_expression_processing/plink_processed_genotype/"
+
+# Directory containing gtex expression data
+gtex_expression_data_dir="/lab-share/CHIP-Strober-e2/Public/ben/gdl_uncertainty_paper/gtex_eqtl_expression_processing/residualized_expression/"
+
+
 #####################
 # Output directories
 #####################
@@ -43,6 +50,8 @@ sum_stats_fm_input_dir=${fine_mapping_output_root}"sum_stats_input/"
 LD_fm_input_dir=${fine_mapping_output_root}"LD_input/"
 
 fine_mapping_results_dir=${fine_mapping_output_root}"fine_mapping_results/"
+
+gtex_expression_prediction_evaluation_dir=${fine_mapping_output_root}"gtex_expression_prediction_evaluation/"
 
 
 if false; then
@@ -61,10 +70,29 @@ fi
 
 #####################
 # Run fine-mapping (standard eQTL-only SuSiE and caQTL-mediated) on the prepared input
+# Also runs generates genetically predicted expression
 #####################
-if false; then
 cell_type="CD4_T"
-    fm_input_summary_file=${sum_stats_fm_input_dir}${cell_type}"_fine_mapping_input_summary_ld_screened.txt"
-    sbatch run_fine_mapping.sh ${fm_input_summary_file} ${cell_type} ${fine_mapping_results_dir}
-fi
+    fm_input_summary_file=${sum_stats_fm_input_dir}${cell_type}"_fine_mapping_input_summary_ld_screened_tmp.txt"
+    sh run_fine_mapping.sh ${fm_input_summary_file} ${cell_type} ${fine_mapping_results_dir}
 
+
+
+#####################
+# Evaluate expresssion predictions in gtex data
+#####################
+fingen_cell_type="CD4_T"
+gtex_tissue_type="Whole_Blood"
+gtex_expression_file=${gtex_expression_data_dir}${gtex_tissue_type}".v8.residualized_expression_renormalized.bed"
+gtex_genotype_plink_stem=${gtex_genotype_data_dir}"gtex_v9_eqtl_chr"
+gtex_genotype_sample_mapping_file=${gtex_genotype_data_dir}"genotype_sample_mapping_to_"${gtex_tissue_type}"_expression_samples.txt"
+gtex_expression_prediction_evaluation_output_file=${gtex_expression_prediction_evaluation_dir}${fingen_cell_type}"_expression_prediction_evaluation_in_"${gtex_tissue_type}".txt"
+
+eqtl_only_prediction_file=${fine_mapping_results_dir}${fingen_cell_type}"_eqtl_only_expression_prediction_results.txt"
+joint_prediction_file=${fine_mapping_results_dir}${fingen_cell_type}"_joint_eqtl_caqtl_expression_prediction_results.txt"
+chromatin_only_prediction_file=${fine_mapping_results_dir}${fingen_cell_type}"_chromatin_only_expression_prediction_results.txt"
+chromatin_informed_prediction_file=${fine_mapping_results_dir}${fingen_cell_type}"_chromatin_informed_expression_prediction_results.txt"
+if false; then
+sh evaluate_expression_prediction_in_gtex.sh ${fingen_cell_type} ${gtex_tissue_type} ${gtex_expression_file} ${gtex_genotype_plink_stem} ${gtex_genotype_sample_mapping_file} ${gtex_expression_prediction_evaluation_output_file} ${eqtl_only_prediction_file} ${joint_prediction_file} ${chromatin_only_prediction_file} ${chromatin_informed_prediction_file}
+
+fi
