@@ -77,13 +77,9 @@ fi
 
 model_num="0"
 
+
 if false; then
-chunk_num="0"
-	variant_vcf_file=$variant_output_stem"chunked_variants_"${chunk_num}".vcf"
-	sbatch fast_borzoi_sed.sh $borzoi_pred_dir"model_"${model_num}"_chunk_"${chunk_num}"_borzoi_results.h5" ${variant_vcf_file} $borzoi_training_dir $model_num $variant_peak_pair_file $peak_gtf_file $borzoi_peak_targets_file
-fi
-if false; then
-for chunk_num in {1..14}
+for chunk_num in {0..14}
 do
 	variant_vcf_file=$variant_output_stem"chunked_variants_"${chunk_num}".vcf"
 	sbatch fast_borzoi_sed.sh $borzoi_pred_dir"model_"${model_num}"_chunk_"${chunk_num}"_borzoi_results.h5" ${variant_vcf_file} $borzoi_training_dir $model_num $variant_peak_pair_file $peak_gtf_file $borzoi_peak_targets_file
