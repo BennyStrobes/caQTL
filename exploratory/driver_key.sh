@@ -61,3 +61,8 @@ for cell_type in "CD4_T" "Mono"; do
     sh visualize_beta_combined.sh ${cell_type} ${pred_beta_combined_dir} ${visualization_dir} ${loeuf_file}
 done
 fi
+
+if false; then
+cell_type="CD4_T"
+sh visualize_beta_combined.sh ${cell_type} ${pred_beta_combined_dir} ${visualization_dir} ${loeuf_file}
+fi

@@ -126,18 +126,24 @@ def equal_count_bins(x, n_bins):
     return bins
 
 
-def bin_means(x, y, bins, n_bins):
-    # Mean and 95% CI (1.96 * SEM) of x and y within each bin
-    n = np.bincount(bins, minlength=n_bins).astype(float)
+def bin_means(x, y, bins, n_bins, n_blocks=200):
+    # Mean of x and y within each bin, with 95% CIs from a genomic block jackknife rather than the per-pair SEM.
+    # Rows are in genomic order, so n_blocks contiguous row blocks are genomic segments and LD between neighbouring
+    # pairs (and the many variants of one gene) stays within blocks. Delete-one-block bin mean: (S - S_b) / (n - n_b).
+    n_rows = len(x)
+    block = (np.arange(n_rows) * n_blocks) // n_rows
+    cell = block * n_bins + bins
+    n_bb = np.bincount(cell, minlength=n_blocks * n_bins).reshape(n_blocks, n_bins).astype(float)
+    n = n_bb.sum(axis=0)
 
     def stats(v):
-        s = np.bincount(bins, weights=v, minlength=n_bins)
-        ss = np.bincount(bins, weights=v * v, minlength=n_bins)
+        s_bb = np.bincount(cell, weights=v, minlength=n_blocks * n_bins).reshape(n_blocks, n_bins)
+        s = s_bb.sum(axis=0)
         with np.errstate(divide='ignore', invalid='ignore'):
             mean = s / n
-            var = (ss - n * mean ** 2) / (n - 1)
-            ci = 1.96 * np.sqrt(var / n)
-        return mean, ci
+            loo = (s - s_bb) / (n - n_bb)
+            se = np.sqrt((n_blocks - 1) / n_blocks * np.nansum((loo - np.nanmean(loo, axis=0)) ** 2, axis=0))
+        return mean, 1.96 * se
 
     x_mean, x_ci = stats(x)
     y_mean, y_ci = stats(y)
@@ -242,30 +248,46 @@ def symlog_threshold(v):
 
 
 def fig_bin_scatter(x, y, n_bins, cell_type, xlabel, ylabel, output_file, symlog=False, linthresh=(5e-5, 5e-4), fit_line=True,
-                    subtitle=None):
+                    subtitle=None, title=True, center=False, noise_floor=None, note=None):
     # Mean y vs mean x within equal-count bins of x, with the OLS fit of y on x over all supplied pairs (not the bin means).
     # With symlog, both axes are log-distance from zero (linear inside +/- linthresh), with ticks in the original units,
     # and the fit is a power law to the bin means, which is a straight line on those axes.
+    # center: subtract the grand mean of y (a small allele-orientation offset in beta_eQTL that symlog magnifies near zero).
+    # noise_floor: shade +/- this value on x (e.g. the median prediction SE) and grey the bins whose mean x lies inside it,
+    # since their x position is within the prediction's own noise. note: extra text for the subtitle (e.g. a pair filter).
     bins = equal_count_bins(x, n_bins)
+    offset = offset_ci = 0.0
+    if center:
+        g = bin_means(y, y, np.zeros(len(y), dtype=np.int64), 1)
+        offset, offset_ci = g['y_mean'][0], g['y_ci95'][0]
+        y = y - offset
     summary = bin_means(x, y, bins, n_bins)
+    summary['y_offset'] = offset
     summary.to_csv(summary_path(output_file), sep='\t', index=False)
     slope, slope_se = ols_slope(x, y)
     intercept = y.mean() - slope * x.mean()
 
     fig, ax = plt.subplots(figsize=(5.8, 5.0))
-    draw_bin_scatter(ax, summary, n_bins)
+    if noise_floor is not None:
+        inside = (summary['x_mean'].abs() < noise_floor).to_numpy()
+        ax.axvspan(-noise_floor, noise_floor, color=GRID_GRAY, alpha=0.4, linewidth=0, zorder=0)
+        draw_bin_scatter(ax, summary[~inside], n_bins)
+        draw_bin_scatter(ax, summary[inside], n_bins, color='#a3a29e')
+    else:
+        draw_bin_scatter(ax, summary, n_bins)
     xm, ym = summary['x_mean'].to_numpy(), summary['y_mean'].to_numpy()
     fit_label = None
     if symlog:
-        # log10|y| = a + b log10|x| over bins outside the linear window with matching signs; b ~ 1 means linear with scale factor c
-        use = (np.abs(xm) > linthresh[0]) & (np.abs(ym) > linthresh[1]) & (np.sign(xm) == np.sign(ym))
-        b, b_se = ols_slope(np.log10(np.abs(xm[use])), np.log10(np.abs(ym[use])))
-        a = np.log10(np.abs(ym[use])).mean() - b * np.log10(np.abs(xm[use])).mean()
-        fit_label = 'Power-law fit to %d bins: |y| = %.2f |x|$^{%.2f}$ (exponent SE %.2f)' % (use.sum(), 10 ** a, b, b_se)
-        for sign, edge in [(-1, -xm.min()), (1, xm.max())]:
-            xs = np.logspace(np.log10(linthresh[0]), np.log10(edge), 200)
-            ax.plot(sign * xs, sign * 10 ** a * xs ** b, color=SERIES[1], linewidth=1.5, zorder=2,
-                    label=fit_label if sign == 1 else None)
+        if fit_line:
+            # log10|y| = a + b log10|x| over bins outside the linear window with matching signs; b ~ 1 means linear with scale factor c
+            use = (np.abs(xm) > linthresh[0]) & (np.abs(ym) > linthresh[1]) & (np.sign(xm) == np.sign(ym))
+            b, b_se = ols_slope(np.log10(np.abs(xm[use])), np.log10(np.abs(ym[use])))
+            a = np.log10(np.abs(ym[use])).mean() - b * np.log10(np.abs(xm[use])).mean()
+            fit_label = 'Power-law fit to %d bins: |y| = %.2f |x|$^{%.2f}$ (exponent SE %.2f)' % (use.sum(), 10 ** a, b, b_se)
+            for sign, edge in [(-1, -xm.min()), (1, xm.max())]:
+                xs = np.logspace(np.log10(linthresh[0]), np.log10(edge), 200)
+                ax.plot(sign * xs, sign * 10 ** a * xs ** b, color=SERIES[1], linewidth=1.5, zorder=2,
+                        label=fit_label if sign == 1 else None)
         ax.set_xscale('symlog', linthresh=linthresh[0], linscale=0.3)
         ax.set_yscale('symlog', linthresh=linthresh[1], linscale=0.3)
         # Decade ticks outside the linear window only, plus zero, so labels do not collide around the origin
@@ -285,8 +307,15 @@ def fig_bin_scatter(x, y, n_bins, cell_type, xlabel, ylabel, output_file, symlog
     ax.set_xlabel(xlabel, color=INK)
     ax.set_ylabel(ylabel, color=INK)
     if subtitle is None:
-        subtitle = '%s pairs in %d equal-count bins; bars are 95%% CIs of bin means' % (compact(len(x)), n_bins)
-    ax.set_title('%s cells' % cell_type, fontsize=10, color=INK, loc='left', pad=18)
+        lines = ['%s pairs%s in %d equal-count bins; bars are 95%% block-jackknife CIs'
+                 % (compact(len(x)), (' with ' + note) if note else '', n_bins)]
+        if center:
+            lines.append('β_eQTL centered on its grand mean %.1e (95%% CI ±%.1e)' % (offset, offset_ci))
+        if noise_floor is not None:
+            lines.append('grey: bins with |mean predicted effect| below the median prediction SE (%.1e)' % noise_floor)
+        subtitle = '\n'.join(lines)
+    if title:
+        ax.set_title('%s cells' % cell_type, fontsize=10, color=INK, loc='left', pad=6 + 12 * (subtitle.count('\n') + 1))
     ax.text(0, 1.012, subtitle, transform=ax.transAxes, fontsize=8, color=INK_SECONDARY, va='bottom', ha='left')
     style_axes(ax)
     fig.tight_layout()
@@ -1024,6 +1053,23 @@ def gene_calls(genes, gene_all, alpha):
     return calls
 
 
+def bh_qvalues(p):
+    # Benjamini-Hochberg q-values (monotone step-up) for a vector of p-values, NaN preserved
+    p = np.asarray(p, dtype=float)
+    q = np.full(p.shape, np.nan)
+    ok = np.isfinite(p)
+    m = int(ok.sum())
+    if m == 0:
+        return q
+    order = np.argsort(p[ok])
+    ranked = p[ok][order] * m / np.arange(1, m + 1)
+    ranked = np.minimum(1.0, np.minimum.accumulate(ranked[::-1])[::-1])
+    tmp = np.empty(m)
+    tmp[order] = ranked
+    q[ok] = tmp
+    return q
+
+
 def decile_index(loeuf, index):
     # LOEUF decile as a 0-based group index aligned to index; -1 where the gene has no LOEUF value
     d = loeuf['loeuf_decile'].reindex(index).to_numpy(dtype=float)
@@ -1537,7 +1583,23 @@ if __name__ == '__main__':
     # 1b. Same, with both axes on a symlog scale (log-distance from zero, original units)
     fig_bin_scatter(beta_pred, beta_eqtl, args.n_bins, args.cell_type,
                     'Mean predicted eQTL effect (Σ β_caQTL × β_link)', 'Mean observed eQTL effect (β_eQTL)',
-                    '%s_%s_scatter_symlog.%s' % (args.output_prefix, label, fmt), symlog=True)
+                    '%s_%s_scatter_symlog.%s' % (args.output_prefix, label, fmt), symlog=True, fit_line=False, title=False)
+    # 1c. Variants of the symlog figure aimed at the bins near zero: beta_eQTL centered on its grand mean, confident
+    #     predictions only (|z_pred| > 1), both, and the prediction noise floor (median se_combined) shaded on x
+    symlog_kw = dict(symlog=True, fit_line=False, title=False)
+    xl, yl = 'Mean predicted eQTL effect (Σ β_caQTL × β_link)', 'Mean observed eQTL effect (β_eQTL)'
+    fig_bin_scatter(beta_pred, beta_eqtl, args.n_bins, args.cell_type, xl, yl,
+                    '%s_%s_scatter_symlog_centered.%s' % (args.output_prefix, label, fmt), center=True, **symlog_kw)
+    fig_bin_scatter(beta_pred, beta_eqtl, args.n_bins, args.cell_type, xl, yl,
+                    '%s_%s_scatter_symlog_noisefloor.%s' % (args.output_prefix, label, fmt),
+                    noise_floor=float(np.median(df['se_combined'].to_numpy())), **symlog_kw)
+    confident = np.abs(z_pred) > 1
+    if confident.sum() >= args.n_bins:
+        fig_bin_scatter(beta_pred[confident], beta_eqtl[confident], args.n_bins, args.cell_type, xl, yl,
+                        '%s_%s_scatter_symlog_zgt1.%s' % (args.output_prefix, label, fmt), note='|z_pred| > 1', **symlog_kw)
+        fig_bin_scatter(beta_pred[confident], beta_eqtl[confident], args.n_bins, args.cell_type, xl, yl,
+                        '%s_%s_scatter_symlog_zgt1_centered.%s' % (args.output_prefix, label, fmt), note='|z_pred| > 1',
+                        center=True, **symlog_kw)
 
     # 2. Same thing on z-scores: observed z vs predicted z, by bin of predicted z
     fig_bin_scatter(z_pred, z_eqtl, args.n_bins, args.cell_type,
@@ -1715,6 +1777,15 @@ if __name__ == '__main__':
         genes.to_csv('%s_per_gene.tsv' % args.output_prefix, sep='\t')
         print("Bonferroni p < %g: eQTL calls %d of %d tested genes; prediction calls %d of %d genes with a prediction"
               % (alpha, int(calls['eqtl_call'].sum()), len(calls), int(calls['pred_call'].sum()), int(calls['has_pred'].sum())), flush=True)
+        # Gene-level counts the standard way: BH across genes on the per-gene Bonferroni p (eQTL: all tested genes;
+        # prediction: genes with a prediction, since the others cannot be called)
+        calls['eqtl_q'] = bh_qvalues(calls['eqtl_p_bonf'].to_numpy())
+        calls['pred_q'] = bh_qvalues(calls['pred_p_bonf'].to_numpy())
+        for fdr in [0.05, 0.01]:
+            print("BH FDR < %g: eQTL genes %d of %d tested; caQTL2G genes %d of %d with a prediction"
+                  % (fdr, int((calls['eqtl_q'] < fdr).sum()), len(calls), int((calls['pred_q'] < fdr).sum()),
+                     int(calls['has_pred'].sum())), flush=True)
+        calls.to_csv('%s_gene_calls.tsv' % args.output_prefix, sep='\t')
 
         # 20. Fraction of genes with a QTL call (observed eQTL vs chromatin-predicted), by LOEUF decile
         summary = fig_qtl_fraction_by_loeuf_decile(genes, gene_all, loeuf, BONF_ALPHAS, args.cell_type,
