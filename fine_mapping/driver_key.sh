@@ -53,6 +53,10 @@ fine_mapping_results_dir=${fine_mapping_output_root}"fine_mapping_results/"
 
 gtex_expression_prediction_evaluation_dir=${fine_mapping_output_root}"gtex_expression_prediction_evaluation/"
 
+cofine_results_dir=${fine_mapping_output_root}"cofine_results/"
+
+cofine_simulation_dir=${fine_mapping_output_root}"cofine_simulation/"
+
 
 if false; then
 cell_type="CD4_T"
@@ -68,14 +72,48 @@ fi
 
 
 
+
+#####################
+# CoFine (grant Aim 3B): simulation on real LD, then real data (each also run without caQTL and peak-gene link data)
+#####################
+cell_type="CD4_T"
+fm_input_summary_file=${sum_stats_fm_input_dir}${cell_type}"_fine_mapping_input_summary_ld_screened_tmp.txt"
+n_genes="500"
+if false; then
+for seed in $(seq 1 50); do
+	sbatch run_cofine_simulation.sh ${fm_input_summary_file} ${cell_type} ${cofine_simulation_dir} ${n_genes} ${seed}
+done
+fi
+
+# Organize simulation results across seeds and make pdf plots (uses every seed whose fits have finished)
+if false; then
+cofine_simulation_viz_dir=${fine_mapping_output_root}"cofine_simulation_visualization/"
+sh organize_and_visualize_cofine_simulation_results.sh ${cofine_simulation_dir} ${cell_type}"_cofine_sim_n_genes_"${n_genes} ${cofine_simulation_viz_dir}
+fi
+
+if false; then
+cell_type="CD4_T"
+fm_input_summary_file=${sum_stats_fm_input_dir}${cell_type}"_fine_mapping_input_summary_ld_screened_tmp.txt"
+sbatch run_cofine.sh ${fm_input_summary_file} ${cell_type} ${cofine_results_dir}
+fi
+
+
+
+
+
+
+
+
+
 #####################
 # Run fine-mapping (standard eQTL-only SuSiE and caQTL-mediated) on the prepared input
 # Also runs generates genetically predicted expression
 #####################
+if false; then
 cell_type="CD4_T"
     fm_input_summary_file=${sum_stats_fm_input_dir}${cell_type}"_fine_mapping_input_summary_ld_screened_tmp.txt"
     sh run_fine_mapping.sh ${fm_input_summary_file} ${cell_type} ${fine_mapping_results_dir}
-
+fi
 
 
 #####################
@@ -96,3 +134,6 @@ if false; then
 sh evaluate_expression_prediction_in_gtex.sh ${fingen_cell_type} ${gtex_tissue_type} ${gtex_expression_file} ${gtex_genotype_plink_stem} ${gtex_genotype_sample_mapping_file} ${gtex_expression_prediction_evaluation_output_file} ${eqtl_only_prediction_file} ${joint_prediction_file} ${chromatin_only_prediction_file} ${chromatin_informed_prediction_file}
 
 fi
+
+
+
