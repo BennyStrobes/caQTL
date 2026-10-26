@@ -91,10 +91,18 @@ cofine_simulation_viz_dir=${fine_mapping_output_root}"cofine_simulation_visualiz
 sh organize_and_visualize_cofine_simulation_results.sh ${cofine_simulation_dir} ${cell_type}"_cofine_sim_n_genes_"${n_genes} ${cofine_simulation_viz_dir}
 fi
 
-if false; then
 cell_type="CD4_T"
-fm_input_summary_file=${sum_stats_fm_input_dir}${cell_type}"_fine_mapping_input_summary_ld_screened_tmp.txt"
-sbatch run_cofine.sh ${fm_input_summary_file} ${cell_type} ${cofine_results_dir}
+fm_input_summary_file=${sum_stats_fm_input_dir}${cell_type}"_fine_mapping_input_summary_ld_screened.txt"
+if false; then
+for model_version in cofine cofine_link_se_inflation cofine_no_chromatin; do
+	sbatch run_cofine.sh ${fm_input_summary_file} ${cell_type} ${cofine_results_dir} ${model_version}
+done
+fi
+
+# Compare the real-data CoFine fit with CoFine without chromatin and make pdf plots (after run_cofine.sh has finished)
+if false; then
+cofine_results_viz_dir=${fine_mapping_output_root}"cofine_results_visualization/"
+sh organize_and_visualize_cofine_real_data_results.sh ${fm_input_summary_file} ${cofine_results_dir} ${cell_type} ${cofine_results_viz_dir}
 fi
 
 

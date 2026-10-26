@@ -10,6 +10,7 @@ from cofine import COFINE, prepare_gene_data
 # Input: the fine-mapping input summary of prepare_input_data_for_fine_mapping.py (one line per gene: LD, eQTL, caQTL and peak-gene files)
 # --no_chromatin drops the caQTL and peak-gene data (every gene gets no peaks): spike-and-slab eQTL fine-mapping with the same sampler,
 # the grant's "CoFine without caQTL and peak-gene link data" comparison
+# --learn_link_se_inflation learns one shared inflation of the squared peak-gene link standard errors (for anti-conservative links)
 
 
 def load_in_input_data(sumstat_summary_file, no_chromatin, max_genes, variance_explained_threshold):
@@ -75,6 +76,8 @@ parser.add_argument('--swap_r2', type=float, default=0.5)  # path swaps between 
 parser.add_argument('--swaps_per_path', type=float, default=2.0)  # 0: no path swaps
 parser.add_argument('--variance_explained_threshold', type=float, default=0.995)  # fraction of the LD trace kept by the low-rank transform
 parser.add_argument('--no_chromatin', action='store_true', default=False)  # drop caQTL and peak-gene data (eQTL-only comparison)
+parser.add_argument('--learn_link_se_inflation', action='store_true', default=False)  # learn a shared inflation c2 of the squared peak-gene link standard errors (anti-conservative links)
+parser.add_argument('--link_se_inflation_prior_df', type=float, default=4.0)  # degrees of freedom of the scaled-inverse-chi-square(df, 1) prior on c2
 parser.add_argument('--max_genes', type=int, default=None)  # only the first max_genes genes (for testing)
 parser.add_argument('--seed', type=int, default=1)
 args = parser.parse_args()
@@ -85,7 +88,7 @@ print('settings: ' + ' '.join(key + '=' + str(value) for key, value in vars(args
 gene_ids, variant_ids_files, genes = load_in_input_data(args.sumstat_summary_file, args.no_chromatin, args.max_genes, args.variance_explained_threshold)
 
 # Fit
-model = COFINE(n_iters=args.n_iters, burn_in=args.burn_in, tgs=not args.no_tgs, tgs_epsilon=args.tgs_epsilon, tgs_sub_steps_per_snp=args.tgs_sub_steps_per_snp, tgs_r2_update_threshold=args.tgs_r2_update_threshold, swap_r2=args.swap_r2, swaps_per_path=args.swaps_per_path, seed=args.seed)
+model = COFINE(n_iters=args.n_iters, burn_in=args.burn_in, tgs=not args.no_tgs, tgs_epsilon=args.tgs_epsilon, tgs_sub_steps_per_snp=args.tgs_sub_steps_per_snp, tgs_r2_update_threshold=args.tgs_r2_update_threshold, swap_r2=args.swap_r2, swaps_per_path=args.swaps_per_path, learn_link_se_inflation=args.learn_link_se_inflation, link_se_inflation_prior_df=args.link_se_inflation_prior_df, seed=args.seed)
 model.fit(genes)
 
 # Per-gene results: values per variant (in variant ids file order) or per peak (in peak order of the input), comma separated

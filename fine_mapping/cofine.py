@@ -13,13 +13,16 @@ from numba import njit
 #   H_j = 1[exists k: delta_kj != 0 and gamma_k != 0]                      variant j has a chromatin-mediated path to the gene
 #   beta_j | H_j = 0 ~ (1 - pi0) delta_0 + pi0 N(0, sigma2_0)                                         (equation 6)
 #   beta_j | H_j = 1 ~ (1 - pi1) delta_0 + pi1 N(lambda m_j, tau2)                                    (equation 7)
-# Shared across genes: pi_delta, sigma2_delta, pi_gamma, sigma2_gamma, pi0, sigma2_0, pi1, lambda, tau2.
+# Shared across genes: pi_delta, sigma2_delta, pi_gamma, sigma2_gamma, pi0, sigma2_0, pi1, lambda, tau2 (and c2, below).
 #
 # Likelihoods. eQTL and caQTL marginal effects (standardized genotype; one standard error per gene or peak, s) are transformed
 # to the low-rank eigen-space of the LD (SBayesRC-style; as in eb_coloc/multi_causal_variant/real_data/mcvc_tempered.py):
 #   w = Lambda^{-1/2} U' b_hat = Q beta + eps,  Q = Lambda^{1/2} U',  eps ~ N(0, resid_var I_k)
 # with one residual variance per gene (eQTL) and per peak (caQTL), initialized at s^2. Peak-gene links:
-#   gamma_hat_k ~ N(gamma_k, se_k^2)  (diagonal; marginal link statistics)
+#   gamma_hat_k ~ N(gamma_k, c2 se_k^2)  (diagonal; marginal link statistics)
+# c2 = 1, or (learn_link_se_inflation) one shared inflation of the squared link standard errors for anti-conservative link statistics,
+# with a scaled-inverse-chi-square(link_se_inflation_prior_df, 1) prior. Most tested peak-gene pairs are null (gamma_k = 0), so c2 is
+# identified by the spread of their z-scores (a model-based genomic-control factor for the links).
 #
 # Gibbs sampler, one sweep per gene:
 #   1. gamma_k for each peak, with gamma_k integrated out of its slab: the link statistic and, through equation 7, the current eQTL
@@ -63,69 +66,113 @@ def _logaddexp(a, b):
     return m + np.log(np.exp(a - m) + np.exp(b - m))
 
 
+_SELECTION_BLOCK_SIZE = 32  # sites per partial sum of the tempered selection weights
+
+
 @njit(cache=True)
-def _rebuild_p_sel(log_p_sel, p_sel, ref):
-    # Re-express the selection weights relative to the largest one: p_sel = exp(log_p_sel - ref)
+def _sum_block(blk, p_sel, block_sum):
+    # block_sum[blk] = sum of p_sel over the sites of block blk (recomputed from the sites rather than updated by differences, so no
+    # rounding error accumulates: the weights span hundreds of orders of magnitude)
+    start = blk * _SELECTION_BLOCK_SIZE
+    end = min(start + _SELECTION_BLOCK_SIZE, p_sel.shape[0])
+    s = 0.0
+    for k in range(start, end):
+        s += p_sel[k]
+    block_sum[blk] = s
+
+
+@njit(cache=True)
+def _rebuild_p_sel(log_p_sel, p_sel, ref, block_sum):
+    # Re-express the selection weights relative to the largest one: p_sel = exp(log_p_sel - ref), and recompute their block sums
     ref[0] = np.max(log_p_sel)
     for k in range(log_p_sel.shape[0]):
         p_sel[k] = np.exp(log_p_sel[k] - ref[0])
+    for blk in range(block_sum.shape[0]):
+        _sum_block(blk, p_sel, block_sum)
 
 
 @njit(cache=True)
-def _update_site(a, dot, beta, z, q_norm_sq, resid_var, log_w_off, log_w_on, slab_mean, slab_var, P_on, logit_on, log_p_sel, p_sel, ref, log_one_minus_eps, log_eps_half):
+def _update_site(a, dot, beta, z, q_norm_sq, V, total_var, half_log_var_ratio, log_w_off, log_w_on, slab_mean, P_on, logit_on, log_p_sel, p_sel, ref, block_sum, acc_P_on, last_sum_w, sum_w, log_one_minus_eps, log_eps_half):
     # Full conditional inclusion probability of site a (own effect added back into its residual dot product) -> P_on[a] (and its
     # log-odds logit_on[a]), and its tempered selection weight p_a = g_a(current class) / P_a(current class) = (1 - eps) + (eps / 2) / P_a(current class)
-    # -> log_p_sel[a], held as p_sel[a] = exp(log_p_sel[a] - ref[0]). Everything is computed from the log-odds: P(current class) can
-    # be far below the smallest double (strong effects in LD), and 1 - P_on would round to 0 and corrupt the selection and the weights
+    # -> log_p_sel[a], held as p_sel[a] = exp(log_p_sel[a] - ref[0]) (the caller then recomputes the sum of a's block). Everything is
+    # computed from the log-odds: P(current class) can be far below the smallest double (strong effects in LD), and 1 - P_on would
+    # round to 0 and corrupt the selection and the weights.
+    # V, total_var, half_log_var_ratio: per-site constants of the block (resid_var / |q_a|^2, slab_var + V, 0.5 log(total_var / V)).
+    # Before P_on[a] changes, the weights of the sub-states visited since its last change (sum_w - last_sum_w[a]) are credited to acc_P_on[a]
+    acc_P_on[a] += P_on[a] * (sum_w - last_sum_w[a])
+    last_sum_w[a] = sum_w
     qn = q_norm_sq[a]
     b = (dot[a] + qn * beta[a]) / qn
-    V = resid_var / qn
-    total_var = slab_var[a] + V
     # log BF of a N(slab_mean, slab_var) slab: log N(b; slab_mean, slab_var + V) - log N(b; 0, V)
-    log_bf = -0.5 * np.log(total_var / V) - 0.5 * (b - slab_mean[a]) ** 2 / total_var + 0.5 * b * b / V
+    log_bf = -half_log_var_ratio[a] - 0.5 * (b - slab_mean[a]) ** 2 / total_var[a] + 0.5 * b * b / V[a]
     x = log_w_on[a] + log_bf - log_w_off[a]
     logit_on[a] = x
-    P_on[a] = np.exp(_log_expit(x))
-    if z[a] == 1:
-        log_pc = _log_expit(x)
+    # log P_on and log (1 - P_on) (= _log_expit(x) and _log_expit(-x)), sharing log(1 + exp(-|x|))
+    log1p_term = np.log1p(np.exp(-abs(x)))
+    if x >= 0.0:
+        log_p_on = -log1p_term
+        log_p_off = -x - log1p_term
     else:
-        log_pc = _log_expit(-x)
+        log_p_on = x - log1p_term
+        log_p_off = -log1p_term
+    P_on[a] = np.exp(log_p_on)
+    if z[a] == 1:
+        log_pc = log_p_on
+    else:
+        log_pc = log_p_off
     lp = _logaddexp(log_one_minus_eps, log_eps_half - log_pc)
     log_p_sel[a] = lp
     if lp - ref[0] > 500.0:
-        _rebuild_p_sel(log_p_sel, p_sel, ref)
+        _rebuild_p_sel(log_p_sel, p_sel, ref, block_sum)
     else:
         p_sel[a] = np.exp(lp - ref[0])
 
 
 @njit(cache=True)
 def _tgs_block_numba(Qt, G, q_norm_sq, nbr_indptr, nbr_indices, resid, beta, z, log_w_off, log_w_on, slab_mean, slab_var, resid_var,
-                     n_sub_steps, epsilon, P_on, logit_on, log_p_sel, p_sel, ref, dot, acc_P_on, snap_beta, snap_z, stats):
+                     n_sub_steps, epsilon, P_on, logit_on, log_p_sel, p_sel, ref, block_sum, block_stamp, site_consts, dot, acc_P_on, last_sum_w, snap_beta, snap_z, stats):
     # Tempered Gibbs over the spike-and-slab effects of one block (n_snps sites sharing one residual vector). Site j is null
     # (log prior weight log_w_off[j]) or has an effect drawn from N(slab_mean[j], slab_var[j]) (log prior weight log_w_on[j]).
     # On entry resid = w - Q beta. On exit (beta, z, resid) are the last sub-state (the caller replaces them with the snapshot);
     # acc_P_on holds the importance-weighted MEAN of the Rao-Blackwellized inclusion probabilities over the visited sub-states and
     # (snap_beta, snap_z) one visited sub-state drawn with probability proportional to its weight.
-    # The weights 1 / Z vary over hundreds of orders of magnitude, so they are accumulated on a running log scale (log_scale).
+    # The weights 1 / Z vary over hundreds of orders of magnitude, so they are accumulated relative to a log scale (log_scale) that
+    # is raised whenever a weight would exceed exp(200) on it (the squared weights then stay far below the largest double).
+    # Bookkeeping per sub-step avoids passes over all sites where it can (the cost is dominated by the conditionals of the
+    # neighbours of a moved site): the selection weights are summed in blocks of _SELECTION_BLOCK_SIZE sites (block_sum; only the
+    # blocks of updated sites are re-summed, block_stamp marks those done in the current sub-step), and acc_P_on is accumulated
+    # lazily, each site being credited P_on times the weights summed since its last change (last_sum_w), when it changes and at the end.
+    # site_consts: work array (3 x n_snps) for the per-site constants of _update_site.
     # stats: [0] number of class changes, [1] log of the sum of the weights, [2] effective sample size of the weights.
     # epsilon = 0 gives random-scan Gibbs (uniform site choice, unit weights).
     n_snps = Qt.shape[0]
     n_components = Qt.shape[1]
+    n_blocks = block_sum.shape[0]
     one_minus_eps = 1.0 - epsilon
     eps_half = epsilon / 2.0
     log_one_minus_eps = np.log(one_minus_eps) if one_minus_eps > 0.0 else -np.inf
     log_eps_half = np.log(eps_half) if eps_half > 0.0 else -np.inf
     log_n = np.log(n_snps)
+    V = site_consts[0]
+    total_var = site_consts[1]
+    half_log_var_ratio = site_consts[2]
     for j in range(n_snps):
         s1 = 0.0
         for i in range(n_components):
             s1 += Qt[j, i] * resid[i]
         dot[j] = s1
+        V[j] = resid_var / q_norm_sq[j]
+        total_var[j] = slab_var[j] + V[j]
+        half_log_var_ratio[j] = 0.5 * np.log(total_var[j] / V[j])
+    for blk in range(n_blocks):
+        block_stamp[blk] = -1
     ref[0] = 0.0
     for j in range(n_snps):
-        _update_site(j, dot, beta, z, q_norm_sq, resid_var, log_w_off, log_w_on, slab_mean, slab_var, P_on, logit_on, log_p_sel, p_sel, ref, log_one_minus_eps, log_eps_half)
         acc_P_on[j] = 0.0
-    _rebuild_p_sel(log_p_sel, p_sel, ref)
+        last_sum_w[j] = 0.0
+        _update_site(j, dot, beta, z, q_norm_sq, V, total_var, half_log_var_ratio, log_w_off, log_w_on, slab_mean, P_on, logit_on, log_p_sel, p_sel, ref, block_sum, acc_P_on, last_sum_w, 0.0, log_one_minus_eps, log_eps_half)
+    _rebuild_p_sel(log_p_sel, p_sel, ref, block_sum)
     log_scale = -np.inf
     sum_w = 0.0
     sum_w_sq = 0.0
@@ -133,37 +180,47 @@ def _tgs_block_numba(Qt, G, q_norm_sq, nbr_indptr, nbr_indices, resid, beta, z, 
     for step in range(n_sub_steps):
         # Weight of the current state: 1 / Z, Z = mean_j p_j = exp(ref) * sum_j p_sel_j / n
         s = 0.0
-        for j in range(n_snps):
-            s += p_sel[j]
+        for blk in range(n_blocks):
+            s += block_sum[blk]
         if s < 1e-250:
-            _rebuild_p_sel(log_p_sel, p_sel, ref)
+            _rebuild_p_sel(log_p_sel, p_sel, ref, block_sum)
             s = 0.0
-            for j in range(n_snps):
-                s += p_sel[j]
+            for blk in range(n_blocks):
+                s += block_sum[blk]
         log_w = log_n - ref[0] - np.log(s)
-        if log_w > log_scale:
-            factor = np.exp(log_scale - log_w)
-            for j in range(n_snps):
-                acc_P_on[j] *= factor
-            sum_w *= factor
-            sum_w_sq *= factor * factor
+        if log_w > log_scale + 200.0:
+            if sum_w > 0.0:
+                factor = np.exp(log_scale - log_w)
+                for j in range(n_snps):
+                    acc_P_on[j] *= factor
+                    last_sum_w[j] *= factor
+                sum_w *= factor
+                sum_w_sq *= factor * factor
             log_scale = log_w
         w = np.exp(log_w - log_scale)
         sum_w += w
         sum_w_sq += w * w
-        for j in range(n_snps):
-            acc_P_on[j] += w * P_on[j]
         # Weighted reservoir sampling of the state handed on
         if np.random.random() * sum_w < w:
             for j in range(n_snps):
                 snap_beta[j] = beta[j]
                 snap_z[j] = z[j]
 
-        # Informed choice of the site to update: j with probability proportional to p_j
+        # Informed choice of the site to update: j with probability proportional to p_j (first its block, then the site within it)
         u = np.random.random() * s
         acc = 0.0
-        j = n_snps - 1
-        for a in range(n_snps):
+        blk = n_blocks - 1
+        for bb in range(n_blocks):
+            if u < acc + block_sum[bb]:
+                blk = bb
+                break
+            acc += block_sum[bb]
+        u -= acc
+        start = blk * _SELECTION_BLOCK_SIZE
+        end = min(start + _SELECTION_BLOCK_SIZE, n_snps)
+        acc = 0.0
+        j = end - 1
+        for a in range(start, end):
             acc += p_sel[a]
             if u < acc:
                 j = a
@@ -178,15 +235,14 @@ def _tgs_block_numba(Qt, G, q_norm_sq, nbr_indptr, nbr_indices, resid, beta, z, 
         qn = q_norm_sq[j]
         b_new = 0.0
         if z_new == 1:
-            V = resid_var / qn
             b = (dot[j] + qn * beta[j]) / qn
-            post_var = 1.0 / (1.0 / V + 1.0 / slab_var[j])
-            b_new = post_var * (b / V + slab_mean[j] / slab_var[j]) + np.sqrt(post_var) * np.random.normal()
+            post_var = 1.0 / (1.0 / V[j] + 1.0 / slab_var[j])
+            b_new = post_var * (b / V[j] + slab_mean[j] / slab_var[j]) + np.sqrt(post_var) * np.random.normal()
         if z_new != z[j]:
             n_changes += 1
 
-        # Apply the move: residuals, all dot products (through the Gram matrix), and the conditionals of j's neighbours
-        # (a null site that stays null leaves everything unchanged)
+        # Apply the move: residuals, all dot products (through the Gram matrix), and the conditionals of j's neighbours and the sums
+        # of their blocks (a null site that stays null leaves everything unchanged)
         d = b_new - beta[j]
         z[j] = z_new
         beta[j] = b_new
@@ -196,9 +252,14 @@ def _tgs_block_numba(Qt, G, q_norm_sq, nbr_indptr, nbr_indices, resid, beta, z, 
             for a in range(n_snps):
                 dot[a] -= G[a, j] * d
             for idx in range(nbr_indptr[j], nbr_indptr[j + 1]):
-                _update_site(nbr_indices[idx], dot, beta, z, q_norm_sq, resid_var, log_w_off, log_w_on, slab_mean, slab_var, P_on, logit_on, log_p_sel, p_sel, ref, log_one_minus_eps, log_eps_half)
+                _update_site(nbr_indices[idx], dot, beta, z, q_norm_sq, V, total_var, half_log_var_ratio, log_w_off, log_w_on, slab_mean, P_on, logit_on, log_p_sel, p_sel, ref, block_sum, acc_P_on, last_sum_w, sum_w, log_one_minus_eps, log_eps_half)
+            for idx in range(nbr_indptr[j], nbr_indptr[j + 1]):
+                blk = nbr_indices[idx] // _SELECTION_BLOCK_SIZE
+                if block_stamp[blk] != step:
+                    block_stamp[blk] = step
+                    _sum_block(blk, p_sel, block_sum)
     for j in range(n_snps):
-        acc_P_on[j] /= sum_w
+        acc_P_on[j] = (acc_P_on[j] + P_on[j] * (sum_w - last_sum_w[j])) / sum_w
     stats[0] = n_changes
     stats[1] = log_scale + np.log(sum_w)
     stats[2] = sum_w * sum_w / sum_w_sq
@@ -245,7 +306,7 @@ class COFINE(object):
     def __init__(self, n_iters=1000, burn_in=400, tgs=True, tgs_epsilon=0.5, tgs_sub_steps_per_snp=1.0, tgs_r2_update_threshold=0.01,
                  pi0_init=5e-3, pi1_init=5e-3, pi_delta_init=5e-3, pi_gamma_init=0.1, lambda_init=0.0,
                  pi_prior_a=1.0, pi_prior_b=1.0, var_prior_df=1e-16, lambda_prior_var=1e4,
-                 swap_r2=0.5, swaps_per_path=2.0,
+                 swap_r2=0.5, swaps_per_path=2.0, learn_link_se_inflation=False, link_se_inflation_prior_df=4.0,
                  update_hyperparameters=True, update_residual_vars=True, seed=None, verbose=True):
         # n_iters: total sweeps; burn_in: sweeps discarded before accumulating posterior summaries
         # tgs: tempered Gibbs for the delta and beta blocks (False: random-scan Gibbs); tgs_epsilon, tgs_sub_steps_per_snp,
@@ -254,6 +315,8 @@ class COFINE(object):
         #     path with an eQTL effect (0: no path swaps)
         # pi_prior_a / pi_prior_b: Beta prior on every inclusion probability; var_prior_df: degrees of freedom of the
         #     scaled-inverse-chi-square priors on every variance (scale = initial value; ~0 is vague); lambda_prior_var: N(0, .) prior on lambda
+        # learn_link_se_inflation: sample the inflation c2 of the squared link standard errors (initialized at 1; False: fixed at 1);
+        #     link_se_inflation_prior_df: degrees of freedom of its scaled-inverse-chi-square prior (scale 1)
         # Slab variances and tau2 are initialized from the data (25 x median squared standard error: effects of ~5 standard errors)
         if burn_in >= n_iters:
             raise ValueError('burn_in must be smaller than n_iters')
@@ -274,11 +337,16 @@ class COFINE(object):
         self.pi_prior_b = pi_prior_b
         self.var_prior_df = var_prior_df
         self.lambda_prior_var = lambda_prior_var
+        self.learn_link_se_inflation = learn_link_se_inflation
+        self.link_se_inflation_prior_df = link_se_inflation_prior_df
+        self.link_se_inflation = 1.0
         self.update_hyperparameters = update_hyperparameters
         self.update_residual_vars = update_residual_vars
         self.seed = seed
         self.verbose = verbose
         self.hyperparameter_names = ['pi0', 'sigma2_0', 'pi1', 'lambda', 'tau2', 'pi_delta', 'sigma2_delta', 'pi_gamma', 'sigma2_gamma']
+        if self.learn_link_se_inflation:
+            self.hyperparameter_names.append('link_se_inflation')
 
     def fit(self, genes):
         # genes: list of dicts, one per gene, from prepare_gene_data()
@@ -324,7 +392,10 @@ class COFINE(object):
         return self
 
     def current_hyperparameters(self):
-        return np.asarray([self.pi0, self.sigma2_0, self.pi1, self.lam, self.tau2, self.pi_delta, self.sigma2_delta, self.pi_gamma, self.sigma2_gamma])
+        values = [self.pi0, self.sigma2_0, self.pi1, self.lam, self.tau2, self.pi_delta, self.sigma2_delta, self.pi_gamma, self.sigma2_gamma]
+        if self.learn_link_se_inflation:
+            values.append(self.link_se_inflation)
+        return np.asarray(values)
 
     def initialize(self, genes):
         self.genes = genes
@@ -357,7 +428,9 @@ class COFINE(object):
                 'm': np.zeros(p), 'n_path': np.zeros(p, dtype=np.int64),
                 # work arrays of the tempered blocks
                 'P_on': np.zeros(p), 'logit_on': np.zeros(p), 'log_p_sel': np.zeros(p), 'p_sel': np.zeros(p), 'ref': np.zeros(1), 'dot': np.zeros(p),
-                'acc_P_on': np.zeros(p), 'snap_beta': np.zeros(p), 'snap_z': np.zeros(p, dtype=np.int64),
+                'block_sum': np.zeros((p + _SELECTION_BLOCK_SIZE - 1) // _SELECTION_BLOCK_SIZE), 'block_stamp': np.zeros((p + _SELECTION_BLOCK_SIZE - 1) // _SELECTION_BLOCK_SIZE, dtype=np.int64),
+                'site_consts': np.zeros((3, p)), 'acc_P_on': np.zeros(p), 'last_sum_w': np.zeros(p),
+                'snap_beta': np.zeros(p), 'snap_z': np.zeros(p, dtype=np.int64),
                 'acc_P_on_E': np.zeros(p),
                 # posterior accumulators
                 'sum_pip_weighted': np.zeros(p), 'sum_pip_weight': 0.0, 'sum_beta': np.zeros(p), 'sum_H': np.zeros(p), 'sum_m': np.zeros(p), 'sum_link_prob': np.zeros(K),
@@ -391,7 +464,7 @@ class COFINE(object):
         n_sub_steps = max(1, int(round(self.tgs_sub_steps_per_snp * st['p'])))
         _tgs_block_numba(Qt, st['G'], st['q_norm_sq'], st['nbr_indptr'], st['nbr_indices'], resid, effects, z,
                          np.ascontiguousarray(log_w_off), np.ascontiguousarray(log_w_on), np.ascontiguousarray(slab_mean), np.ascontiguousarray(slab_var), resid_var,
-                         n_sub_steps, self.tgs_epsilon, st['P_on'], st['logit_on'], st['log_p_sel'], st['p_sel'], st['ref'], st['dot'], st['acc_P_on'], st['snap_beta'], st['snap_z'], stats)
+                         n_sub_steps, self.tgs_epsilon, st['P_on'], st['logit_on'], st['log_p_sel'], st['p_sel'], st['ref'], st['block_sum'], st['block_stamp'], st['site_consts'], st['dot'], st['acc_P_on'], st['last_sum_w'], st['snap_beta'], st['snap_z'], stats)
         effects[:] = st['snap_beta']
         z[:] = st['snap_z']
         return
@@ -517,7 +590,7 @@ class COFINE(object):
         st = self.state[g]
         gene = self.genes[g]
         gamma_hat = gene['gamma_hat'][k]
-        gamma_se2 = gene['gamma_se'][k] ** 2
+        gamma_se2 = self.link_se_inflation * gene['gamma_se'][k] ** 2
         gamma_old = st['gamma'][k]
         J = np.flatnonzero(st['zC'][k] == 1)
         delta_J = st['delta'][k, J]
@@ -606,6 +679,10 @@ class COFINE(object):
             self.pi_gamma = sample_beta_with_floor(n_gamma_on, self.n_peaks_total, self.pi_prior_a, self.pi_prior_b)
             if n_gamma_on > 0:
                 self.sigma2_gamma = sample_scaled_inv_chi_square(df, scales['sigma2_gamma'], n_gamma_on, ss_gamma)
+            if self.learn_link_se_inflation:
+                # c2 | gamma: the standardized link residuals (gamma_hat_k - gamma_k) / se_k are N(0, c2)
+                ss_link = sum(np.sum(np.square((gene['gamma_hat'] - st['gamma']) / gene['gamma_se'])) for gene, st in zip(self.genes, self.state))
+                self.link_se_inflation = sample_scaled_inv_chi_square(self.link_se_inflation_prior_df, 1.0, self.n_peaks_total, ss_link)
 
     def sample_residual_vars(self):
         df = self.var_prior_df
