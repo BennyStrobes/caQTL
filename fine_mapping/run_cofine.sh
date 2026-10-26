@@ -2,7 +2,7 @@
 #SBATCH -c 1                               # Request one core
 #SBATCH -t 5-09:00                         # Runtime in D-HH:MM format
 #SBATCH -p bch-compute                           # Partition to run in
-#SBATCH --mem=20G                        # Memory total in MiB (for all cores): every gene's low-rank Q and Gram matrix Q'Q are held in memory
+#SBATCH --mem=40G                        # Memory total in MiB (for all cores): every gene's low-rank Q and Gram matrix Q'Q are held in memory
 
 
 fm_input_summary_file=${1}

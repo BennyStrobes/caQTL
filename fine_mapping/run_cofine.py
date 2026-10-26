@@ -14,10 +14,15 @@ from cofine import COFINE, prepare_gene_data
 
 
 def load_in_input_data(sumstat_summary_file, no_chromatin, max_genes, variance_explained_threshold):
-    # Returns ordered gene ids, their variant ids files, and the per-gene inputs of COFINE
+    # Returns ordered gene ids, their variant ids files, the per-gene inputs of COFINE, and per gene the number of input peaks and the
+    # input indices of the peaks passed to COFINE
+    # Peaks whose link has a zero or non-finite standard error (degenerate hurdle fits) are dropped: N(gamma_k, 0) is not a likelihood
     gene_ids = []
     variant_ids_files = []
     genes = []
+    n_input_peaks = []
+    kept_peak_indices = []
+    n_links_dropped = 0
     f = open(sumstat_summary_file, 'r')
     head_count = 0
     for line in f:
@@ -34,6 +39,14 @@ def load_in_input_data(sumstat_summary_file, no_chromatin, max_genes, variance_e
         caqtl_se = np.load(data[6]).reshape(-1, p)
         peak_gene_effects = np.atleast_1d(np.load(data[7]))
         peak_gene_se = np.atleast_1d(np.load(data[8]))
+        keep = np.isfinite(peak_gene_effects) & np.isfinite(peak_gene_se) & (peak_gene_se > 0.0)
+        n_links_dropped += int(np.sum(~keep))
+        n_input_peaks.append(len(keep) if not no_chromatin else 0)
+        kept_peak_indices.append(np.flatnonzero(keep) if not no_chromatin else np.zeros(0, dtype=int))
+        caqtl_effects = caqtl_effects[keep]
+        caqtl_se = caqtl_se[keep]
+        peak_gene_effects = peak_gene_effects[keep]
+        peak_gene_se = peak_gene_se[keep]
         if no_chromatin:
             caqtl_effects = caqtl_effects[:0]
             caqtl_se = caqtl_se[:0]
@@ -51,7 +64,8 @@ def load_in_input_data(sumstat_summary_file, no_chromatin, max_genes, variance_e
         if len(gene_ids) % 500 == 0:
             print('loaded gene ' + str(len(gene_ids)), flush=True)
     f.close()
-    return gene_ids, variant_ids_files, genes
+    print(str(n_links_dropped) + ' peak-gene links dropped for a zero or non-finite link standard error', flush=True)
+    return gene_ids, variant_ids_files, genes, n_input_peaks, kept_peak_indices
 
 
 def array_to_string(arr):
@@ -85,7 +99,7 @@ args = parser.parse_args()
 print('settings: ' + ' '.join(key + '=' + str(value) for key, value in vars(args).items()), flush=True)
 
 # Load in data
-gene_ids, variant_ids_files, genes = load_in_input_data(args.sumstat_summary_file, args.no_chromatin, args.max_genes, args.variance_explained_threshold)
+gene_ids, variant_ids_files, genes, n_input_peaks, kept_peak_indices = load_in_input_data(args.sumstat_summary_file, args.no_chromatin, args.max_genes, args.variance_explained_threshold)
 
 # Fit
 model = COFINE(n_iters=args.n_iters, burn_in=args.burn_in, tgs=not args.no_tgs, tgs_epsilon=args.tgs_epsilon, tgs_sub_steps_per_snp=args.tgs_sub_steps_per_snp, tgs_r2_update_threshold=args.tgs_r2_update_threshold, swap_r2=args.swap_r2, swaps_per_path=args.swaps_per_path, learn_link_se_inflation=args.learn_link_se_inflation, link_se_inflation_prior_df=args.link_se_inflation_prior_df, seed=args.seed)
@@ -94,11 +108,13 @@ model.fit(genes)
 # Per-gene results: values per variant (in variant ids file order) or per peak (in peak order of the input), comma separated
 #   eqtl_pips: P(beta_j != 0); eqtl_posterior_mean: E[beta_j] (standardized genotype, per gene standard error scale of the input)
 #   path_probs: P(H_j = 1), probability of a chromatin-mediated path; chromatin_effect_posterior_mean: E[m_j]
-#   link_probs: P(gamma_k != 0) for each peak
+#   link_probs: P(gamma_k != 0) for each input peak (nan for peaks dropped for a zero or non-finite link standard error)
 t = open(args.output_stem + '_results.txt', 'w')
 t.write('gene_id\tvariant_ids_file\tn_peaks\teqtl_pips\teqtl_posterior_mean\tpath_probs\tchromatin_effect_posterior_mean\tlink_probs\n')
-for gene_id, variant_ids_file, st in zip(gene_ids, variant_ids_files, model.state):
-    t.write(gene_id + '\t' + variant_ids_file + '\t' + str(st['K']) + '\t' + array_to_string(st['eqtl_pip']) + '\t' + array_to_string(st['eqtl_posterior_mean']) + '\t' + array_to_string(st['path_prob']) + '\t' + array_to_string(st['chromatin_effect_posterior_mean']) + '\t' + array_to_string(st['link_prob']) + '\n')
+for gene_id, variant_ids_file, st, n_peaks, kept in zip(gene_ids, variant_ids_files, model.state, n_input_peaks, kept_peak_indices):
+    link_prob = np.full(n_peaks, np.nan)
+    link_prob[kept] = st['link_prob']
+    t.write(gene_id + '\t' + variant_ids_file + '\t' + str(n_peaks) + '\t' + array_to_string(st['eqtl_pip']) + '\t' + array_to_string(st['eqtl_posterior_mean']) + '\t' + array_to_string(st['path_prob']) + '\t' + array_to_string(st['chromatin_effect_posterior_mean']) + '\t' + array_to_string(link_prob) + '\n')
 t.close()
 
 # Hyper-parameters: posterior mean and 95% interval over the retained sweeps, and the retained samples themselves

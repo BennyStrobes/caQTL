@@ -137,8 +137,8 @@ def load_peak_gene_links(peak_gene_links_file, gene_ids):
     # hurdle_combined link version (as in exploratory/generate_beta_combined.py):
     #   beta_link = beta_count + (1 - p) * beta_zero, p = expr_cell_num / total_cell_num
     #   se_link^2 = se_count^2 + (1 - p)^2 * se_zero^2 (components treated as independent)
-    # Links with non-finite or > max_se_link se_link are thrown out: degenerate fits (e.g. near-separated logistic zero
-    # component) give infinite or absurd SEs, and counts are ~0/1 so an SE above 1 per read cannot come from a real fit
+    # Links with non-finite, zero or > max_se_link se_link are thrown out: degenerate fits (e.g. near-separated logistic zero
+    # component) give infinite, zero or absurd SEs, and counts are ~0/1 so an SE above 1 per read cannot come from a real fit
     max_se_link = 1.0
     n_links_bad_se = 0
     gene_id_to_links = {}
@@ -167,7 +167,7 @@ def load_peak_gene_links(peak_gene_links_file, gene_ids):
         p_expr = float(data[expr_cell_col]) / float(data[total_cell_col])
         beta_link = float(data[beta_link_col]) + (1.0 - p_expr) * float(data[beta_zero_col])
         se_link = np.sqrt(float(data[se_link_col]) ** 2 + ((1.0 - p_expr) ** 2) * (float(data[se_zero_col]) ** 2))
-        if not (np.isfinite(beta_link) and np.isfinite(se_link)) or se_link > max_se_link:
+        if not (np.isfinite(beta_link) and np.isfinite(se_link)) or se_link <= 0.0 or se_link > max_se_link:
             n_links_bad_se += 1
             continue
         if (peak_id, gene_id) in seen_links:
@@ -192,7 +192,7 @@ def load_peak_gene_links(peak_gene_links_file, gene_ids):
     for gene_id in genes_in_file:
         if gene_id not in gene_ids:
             n_file_genes_not_in_eqtl += 1
-    print('peak-gene links removed for non-finite or > ' + str(max_se_link) + ' se_link: ' + str(n_links_bad_se))
+    print('peak-gene links removed for non-finite, zero or > ' + str(max_se_link) + ' se_link: ' + str(n_links_bad_se))
     print('peak-gene links file: ' + str(len(genes_in_file)) + ' genes total, ' + str(n_file_genes_not_in_eqtl) + ' not among eqtl genes')
     print('eqtl genes: ' + str(len(gene_ids)) + ' total, ' + str(n_eqtl_genes_not_in_file) + ' absent from links file, ' + str(n_eqtl_genes_na_only) + ' present but only NA links')
     return gene_id_to_links

@@ -99,6 +99,7 @@ for model_version in cofine cofine_link_se_inflation cofine_no_chromatin; do
 done
 fi
 
+
 # Compare the real-data CoFine fit with CoFine without chromatin and make pdf plots (after run_cofine.sh has finished)
 if false; then
 cofine_results_viz_dir=${fine_mapping_output_root}"cofine_results_visualization/"
